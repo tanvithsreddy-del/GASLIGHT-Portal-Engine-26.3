@@ -10814,6 +10814,13 @@ public class CrossingSmoke implements FabricClientGameTest {
             return;
         }
         final boolean clipOn = !AperturePassthroughLever.DISABLE_SEAM_CLIP;
+        if (clipOn && com.warwa.seamlessportals.compat.SodiumCompat.isSodiumLoaded()
+            && !com.warwa.seamlessportals.render.SeamClipRenderer.active()) {
+            throw new AssertionError(tag + "UNSUPPORTED SODIUM SEAM RENDERING — Sodium's"
+                + " section mesher has no seam-exclusion hook, so the renderer deliberately"
+                + " self-gates off while fractional seam state remains active. This is a"
+                + " missing compatibility path, not a delayed section recompile.");
+        }
 
         // Fixture site: 40 blocks east of the main staging, own platform, clear of every other
         // leg's fixtures (portals A/B at px±5; disjoint-gate portal at 2000,100,2000).

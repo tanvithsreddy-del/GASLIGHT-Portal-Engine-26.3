@@ -33,12 +33,18 @@ The compile/tests and disposable dedicated-server startup/reopen/shutdown
 passed. A real graphical client with Sodium passed the vanilla Nether and End
 formation and travel smoke, including an old config requesting portal
 conversion. The broader crossing suite reached multiple genuine gameplay
-legs but **failed** its seam-mesh recompilation assertion. Earlier vanilla
-renderer attempts also suffered a Windows native access violation. The full
-raw evidence and limits are in the [GASLIGHT evaluation](https://github.com/tanvithsreddy-del/GASLIGHT-Edition/blob/main/docs/ENGINE_26_3_EVALUATION.md).
+legs but **failed** its seam-mesh assertion. Source and log inspection found
+that the fractional seam renderer deliberately disables itself under Sodium:
+the necessary Sodium mesh-exclusion hook is missing. The crossing gate now
+names that unsupported path directly; it remains a failure, not a skipped
+pass. Earlier vanilla renderer attempts also suffered a Windows native access
+violation. The [follow-up diagnosis](https://github.com/tanvithsreddy-del/GASLIGHT-Edition/blob/main/docs/SODIUM_SEAM_DIAGNOSIS.md)
+has the source evidence, rejected experiment and raw logs; broader limits are
+in the [GASLIGHT evaluation](https://github.com/tanvithsreddy-del/GASLIGHT-Edition/blob/main/docs/ENGINE_26_3_EVALUATION.md).
 
 The [development JAR](artifacts/development/seamlessportals-fabric-26.3-vanilla-portals-dev.jar)
-is the genuinely built portal-engine fork (SHA-256
+is the earlier genuinely built portal-engine fork, before the diagnostic test
+message was corrected (SHA-256
 `bf1fa5ca9982e5bd962ea81c3c02259c1e6ae124b5e4a084c6317dde09a01311`).
 It is not a GASLIGHT gameplay release; use disposable worlds only.
 
