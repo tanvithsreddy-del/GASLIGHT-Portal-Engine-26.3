@@ -10,7 +10,6 @@
     "client.MixinClientLevel",
     "client.MixinDebugScreenOverlay",
     "client.MixinGlDebug",
-    "client.MixinGui",
     "client.MixinLivingEntity_C",
     "client.MixinMinecraft",
     "client.accessor.IEAtmosphericFogEnvironment",

@@ -5,16 +5,10 @@ import com.mojang.logging.LogUtils;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.player.LocalPlayer;
-import net.minecraft.network.chat.Component;
-import net.minecraft.network.chat.MutableComponent;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
-import qouteall.imm_ptl.core.CHelper;
 import qouteall.imm_ptl.core.IPGlobal;
-import qouteall.imm_ptl.core.McHelper;
 import qouteall.imm_ptl.core.platform_specific.IPConfig;
-import qouteall.imm_ptl.core.portal.Portal;
 import qouteall.imm_ptl.peripheral.dim_stack.DimStackInfo;
 
 import java.io.File;
@@ -25,11 +19,9 @@ import java.io.IOException;
 /**
  * S19-A 1:1 port of IP:peripheral/IPOuterClientMisc.java (held out at S16, landed with the
  * wand-runtime bring-up — it is the first entry in IP's PeripheralModMain.initClient()).
- * Outer per-install client state ({@code imm_ptl_state.json} in the game dir): one-time
- * wiki-inform on first client portal spawn + the legacy dimension-stack-preset upgrade into
- * IPConfig. No 26.2 adaptation needed — pure gson/file/chat code; every dependency
- * (IPConfig.dimStackPreset, Portal.CLIENT_PORTAL_SPAWN_EVENT, CHelper.printChat,
- * McHelper.getLinkText, IPGlobal.gson, DimStackInfo) is already ported.
+ * Outer per-install client state ({@code imm_ptl_state.json} in the game dir):
+ * legacy dimension-stack-preset upgrade into IPConfig. The first-portal wiki
+ * chat tip is intentionally absent from the GASLIGHT-facing engine.
  */
 @Environment(EnvType.CLIENT)
 public class IPOuterClientMisc {
@@ -105,28 +97,5 @@ public class IPOuterClientMisc {
             }
         }
 
-        Portal.CLIENT_PORTAL_SPAWN_EVENT.register(p -> {
-            LocalPlayer player = Minecraft.getInstance().player;
-
-            if (!outerConfig.wikiInformed) {
-                if (player != null && player.isCreative()) {
-                    outerConfig.wikiInformed = true;
-                    writeToFile(outerConfig);
-                    informWithURL(
-                        "https://qouteall.fun/immptl/wiki/Portal-Customization",
-                        Component.translatable("imm_ptl.inform_wiki")
-                    );
-                }
-            }
-
-        });
-    }
-
-    private static void informWithURL(String link, MutableComponent text) {
-        CHelper.printChat(
-            text.append(
-                McHelper.getLinkText(link)
-            )
-        );
     }
 }

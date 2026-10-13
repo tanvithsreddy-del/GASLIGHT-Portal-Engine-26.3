@@ -1464,7 +1464,7 @@ public class IPGlobal {
     
     public static boolean checkModInfoFromInternet = true;
     
-    public static boolean enableUpdateNotification = true;
+    public static boolean enableUpdateNotification = false;
     
     public static boolean logClientPlayerCollidingPortalUpdate = false;
     
@@ -1504,7 +1504,7 @@ public class IPGlobal {
         vanilla
     }
     
-    public static NetherPortalMode netherPortalMode = NetherPortalMode.adaptive;
+    public static NetherPortalMode netherPortalMode = NetherPortalMode.vanilla;
     
-    public static EndPortalMode endPortalMode = EndPortalMode.normal;
+    public static EndPortalMode endPortalMode = EndPortalMode.vanilla;
 }

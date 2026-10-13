@@ -173,21 +173,6 @@ public class IPModInfoChecking {
                 MyTaskList.oneShotTask(() -> {
                     List<MutableComponent> texts = new ArrayList<>();
 
-                    if (IPGlobal.enableUpdateNotification) {
-                        if (O_O.shouldUpdateImmPtl(immPtlInfo.latestReleaseVersion)) {
-                            MutableComponent text1 = Component.translatable(
-                                "imm_ptl.new_version_available",
-                                immPtlInfo.latestReleaseVersion
-                            );
-                            text1.append(McHelper.getLinkText(O_O.getModDownloadLink()));
-
-                            text1.append(Component.literal("  "));
-                            text1.append(IPMcHelper.getDisableUpdateCheckText());
-
-                            texts.add(text1);
-                        }
-                    }
-
                     if (IPConfig.getConfig().shouldDisplayWarning("preview")) {
                         if (immPtlInfo.previewVersions.contains(O_O.getImmPtlVersionStr())) {
                             MutableComponent text1 = Component.translatable("imm_ptl.preview_warning")
@@ -294,12 +279,6 @@ public class IPModInfoChecking {
             }
 
             ServerTaskList.of(server).addOneShotTask(() -> {
-                if (IPGlobal.enableUpdateNotification) {
-                    if (O_O.shouldUpdateImmPtl(immPtlInfo.latestReleaseVersion)) {
-                        LOGGER.info("[Immersive Portals] A new version is available. It is recommended to update to " + immPtlInfo.latestReleaseVersion);
-                    }
-                }
-
                 for (ModIncompatInfo mod : immPtlInfo.severelyIncompatible) {
                     if (mod != null && mod.isModLoadedWithinVersion()) {
                         MutableComponent text1;

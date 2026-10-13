@@ -927,6 +927,16 @@ loom {
             //   .\gradlew.bat :fabric:runClientSodium -PirisRuntime=true -PdisableXcutFragFloor=true
             if (project.findProperty('disableXcutFragFloor') == 'true') { vmArg('-Dseamlessportals.disableXcutFragFloor=true') }
         }
+        // Isolated vanilla-dimension-portal regression. The run dir deliberately
+        // contains legacy converted-portal settings; the preservation gate wins.
+        vanillaPortalGametest {
+            client()
+            setConfigName('Vanilla Dimension Portal Smoke')
+            runDir('runs/gametest-vanilla')
+            property('fabric.client.gametest', 'true')
+            property('fabric.client.gametest.modid', project.mod_id)
+            property('seamlessportals.gametest.only', 'vanilla-portals')
+        }
         // Automated title-card capture via the Fabric client-gametest API.
         // Drives a real client: creates a world, builds + lights a portal,
         // walks through, frames the nether->overworld portal view and
@@ -1506,6 +1516,16 @@ tasks.matching { it.name == 'runClientGametest' }.configureEach {
     }
 }
 
+tasks.matching { it.name == 'runVanillaPortalGametest' }.configureEach {
+    doFirst {
+        def cfgDir = file('runs/gametest-vanilla/config')
+        cfgDir.mkdirs()
+        new File(cfgDir, 'seamlessportals.properties').text = 'entityPortals=true\n'
+        new File(cfgDir, 'immersive_portals.json').text =
+            '{\n  "netherPortalMode": "adaptive",\n  "endPortalMode": "normal"\n}\n'
+    }
+}
+
 // Seed the entity-portal MASTER SWITCH into the crossing-smoke run dir before every
 // launch. EntityPortalsFlag reads <configDir>/seamlessportals.properties ONCE at
 // mixin-bootstrap (load-time, before any mod initializer), so the file must exist
@@ -1517,11 +1537,11 @@ tasks.matching { it.name == 'runCrossingGametest' }.configureEach {
         def cfgDir = file('runs/gametest-crossing/config')
         cfgDir.mkdirs()
         new File(cfgDir, 'seamlessportals.properties').text = 'entityPortals=true\n'
-        // Suppress IP's one-time first-launch splash (IPortalInitialScreen,
-        // MixinGui append gate !initialScreenShown) — the client-gametest
-        // framework asserts a bare title screen between tests, and the splash
-        // sits over it. Gson AutoConfig leaves absent fields at their defaults.
-        new File(cfgDir, 'immersive_portals.json').text = '{\n  "initialScreenShown": true\n}\n'
+        // This suite exercises the provider's converted Nether portals and live
+        // seam bindings. Production retains vanilla dimension portals and leaves
+        // passthrough extras off; only this disposable fixture opts into both.
+        new File(cfgDir, 'immersive_portals.json').text =
+            '{\n  "passthroughExtras": true,\n  "preserveVanillaDimensionPortals": false,\n  "netherPortalMode": "adaptive",\n  "endPortalMode": "normal"\n}\n'
     }
 }
 

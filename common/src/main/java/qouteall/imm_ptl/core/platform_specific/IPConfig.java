@@ -206,7 +206,7 @@ public class IPConfig implements ConfigData {
     @ConfigEntry.Gui.Excluded
     public boolean checkModInfoFromInternet = true;
     @ConfigEntry.Gui.Excluded
-    public boolean enableUpdateNotification = true;
+    public boolean enableUpdateNotification = false;
     @ConfigEntry.Gui.Excluded
     public boolean sharedBlockMeshBufferOptimization = true;
     @ConfigEntry.Gui.Excluded
@@ -227,8 +227,6 @@ public class IPConfig implements ConfigData {
     public int portalWandCursorAlignment = 2; // zero for no align
     @ConfigEntry.Gui.Excluded
     public boolean saveMemoryInBufferPack = false;
-    @ConfigEntry.Gui.Excluded
-    public boolean initialScreenShown = false;
     
     // common visible configs
 
@@ -244,15 +242,17 @@ public class IPConfig implements ConfigData {
     @ConfigEntry.Gui.Tooltip
     public boolean passthroughExtras = false;
 
-    @ConfigEntry.Gui.EnumHandler(option = ConfigEntry.Gui.EnumHandler.EnumDisplayOption.BUTTON)
-    public IPGlobal.NetherPortalMode netherPortalMode =
-        IPFeatureControl.enableVanillaBehaviorChangingByDefault() ?
-            IPGlobal.NetherPortalMode.adaptive : IPGlobal.NetherPortalMode.vanilla;
+    @ConfigEntry.Gui.Excluded
+    public IPGlobal.NetherPortalMode netherPortalMode = IPGlobal.NetherPortalMode.vanilla;
     
-    @ConfigEntry.Gui.EnumHandler(option = ConfigEntry.Gui.EnumHandler.EnumDisplayOption.BUTTON)
-    public IPGlobal.EndPortalMode endPortalMode =
-        IPFeatureControl.enableVanillaBehaviorChangingByDefault() ?
-            IPGlobal.EndPortalMode.normal : IPGlobal.EndPortalMode.vanilla;
+    @ConfigEntry.Gui.Excluded
+    public IPGlobal.EndPortalMode endPortalMode = IPGlobal.EndPortalMode.vanilla;
+
+    // Existing Immersive Portals configs may request converted Nether/End portals.
+    // Keep vanilla travel even when such an old config is loaded. The provider's
+    // disposable crossing fixture opts out explicitly to exercise its portal engine.
+    @ConfigEntry.Gui.Excluded
+    public boolean preserveVanillaDimensionPortals = true;
     
     public boolean enableMirrorCreation =
         IPFeatureControl.enableVanillaBehaviorChangingByDefault();
@@ -319,10 +319,10 @@ public class IPConfig implements ConfigData {
         regularPortalLengthLimit = Mth.clamp(regularPortalLengthLimit, 3, 64);
         scaleLimit = Mth.clamp(scaleLimit, 8, 128);
         if (netherPortalMode == null) {
-            netherPortalMode = IPGlobal.NetherPortalMode.adaptive;
+            netherPortalMode = IPGlobal.NetherPortalMode.vanilla;
         }
         if (endPortalMode == null) {
-            endPortalMode = IPGlobal.EndPortalMode.normal;
+            endPortalMode = IPGlobal.EndPortalMode.vanilla;
         }
         if (crossPortalEntityClipMechanism == null) {
             crossPortalEntityClipMechanism =
@@ -396,8 +396,10 @@ public class IPConfig implements ConfigData {
         IPGlobal.looseMovementCheck = looseMovementCheck;
         IPGlobal.pureMirror = pureMirror;
         IPGlobal.indirectLoadingRadiusCap = indirectLoadingRadiusCap;
-        IPGlobal.netherPortalMode = netherPortalMode;
-        IPGlobal.endPortalMode = endPortalMode;
+        IPGlobal.netherPortalMode = preserveVanillaDimensionPortals ?
+            IPGlobal.NetherPortalMode.vanilla : netherPortalMode;
+        IPGlobal.endPortalMode = preserveVanillaDimensionPortals ?
+            IPGlobal.EndPortalMode.vanilla : endPortalMode;
         IPGlobal.reducedPortalRendering = reducedPortalRendering;
         IPGlobal.offsetOcclusionQuery = visibilityPrediction;
         IPGlobal.netherPortalOverlay = netherPortalOverlay;
