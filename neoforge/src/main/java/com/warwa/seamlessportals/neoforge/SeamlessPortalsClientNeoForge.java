@@ -1,0 +1,204 @@
+package com.warwa.seamlessportals.neoforge;
+
+import com.warwa.seamlessportals.SeamlessPortalsConstants;
+import com.warwa.seamlessportals.EntityPortalsFlag;
+import com.warwa.seamlessportals.client.PortalEntityRenderers;
+import com.warwa.seamlessportals.client.SeamlessConfigScreen;
+import com.warwa.seamlessportals.compat.RenderCompatGating;
+import com.warwa.seamlessportals.config.SeamlessPortalsConfig;
+import com.warwa.seamlessportals.neoforge.network.NeoForgePlatformHelper;
+import com.warwa.seamlessportals.render.StencilPortalRenderer;
+import net.minecraft.client.Minecraft;
+import net.neoforged.api.distmarker.Dist;
+import net.neoforged.bus.api.IEventBus;
+import net.neoforged.fml.ModContainer;
+import net.neoforged.fml.common.Mod;
+import net.neoforged.fml.event.lifecycle.FMLClientSetupEvent;
+import net.neoforged.neoforge.client.event.ClientTickEvent;
+import net.neoforged.neoforge.client.event.EntityRenderersEvent;
+import net.neoforged.neoforge.client.event.RenderLevelStageEvent;
+import net.neoforged.neoforge.client.gui.IConfigScreenFactory;
+import net.neoforged.neoforge.common.NeoForge;
+import org.joml.Matrix4f;
+import qouteall.imm_ptl.core.IPCGlobal;
+import qouteall.imm_ptl.core.render.context_management.PortalRendering;
+import qouteall.imm_ptl.core.render.renderer.PortalRenderer;
+
+/**
+ * NF-PARITY W6/W7/W19 (2026-08-25): the NeoForge CLIENT entry point — dist-gated
+ * {@code @Mod}, full parity with {@code SeamlessPortalsClientFabric}. Timing map:
+ * <ul>
+ *   <li>renderer-queue fill + mod-bus listeners → the ctor. {@code RegisterRenderers} is
+ *       posted from {@code Minecraft.<init>} (NF Minecraft.java:702) BEFORE
+ *       {@code FMLClientSetupEvent} (:719), so the queue must be full at ctor time — it is
+ *       (the ctor runs during mod construction, long before {@code new Minecraft}).</li>
+ *   <li>the IP client init chain → {@code FMLClientSetupEvent.enqueueWork} (main thread;
+ *       {@code Minecraft.getInstance()} exists — we are inside its ctor at :719, which is
+ *       exactly why {@code IPModMainClient}'s GL block already wraps itself in
+ *       {@code mc.execute}). Fabric runs the same chain from its client entrypoint
+ *       mid-{@code Minecraft.<init>} — the same window.</li>
+ *   <li>the flag-ON render dispatch → {@code RenderLevelStageEvent.AfterTranslucentBlocks}
+ *       (game bus), the exact-instruction match of Fabric's AFTER_TRANSLUCENT_TERRAIN
+ *       (posted immediately after {@code renderGroup(TRANSLUCENT, ...)}, NF
+ *       LevelRenderer.java:474-476).</li>
+ * </ul>
+ */
+@Mod(value = SeamlessPortalsConstants.MOD_ID, dist = Dist.CLIENT)
+public class SeamlessPortalsClientNeoForge {
+
+    public SeamlessPortalsClientNeoForge(IEventBus modEventBus, ModContainer container) {
+        SeamlessPortalsConstants.LOGGER.info("Seamless Portals client initializing (NeoForge)");
+
+        // ===== WIRE 2: UNCONDITIONAL entity-renderer registration (both flag states) =====
+        // Same rationale as Fabric's call-site note: entity types register unconditionally
+        // (D3), so their renderers must too. registerAll() runs INSIDE the event listener,
+        // not at ctor time — it references Portal.ENTITY_TYPE and friends, whose <clinit>
+        // BUILDS the types (intrusive holders — frozen-registry crash before the window; the
+        // E0 boot lesson). By RegisterRenderers (Minecraft.<init>) they are long initialized.
+        modEventBus.addListener((EntityRenderersEvent.RegisterRenderers event) -> {
+            PortalEntityRenderers.registerAll();
+            NeoForgePlatformHelper.drainEntityRendererRegistrations(event::registerEntityRenderer);
+        });
+
+        modEventBus.addListener(this::onClientSetup);
+        // NF-PARITY L6 fix #2: the secondary-world reload FORWARDER must register inside
+        // NeoForge's one listener window (the list freezes after this event).
+        modEventBus.addListener(
+            com.warwa.seamlessportals.neoforge.platform.NeoForgeClientPlatform::onAddReloadListeners);
+
+        // Mod-list config button (the ModMenu equivalent) — same flag route as
+        // fabric ModMenuIntegration: flag-ON -> IP's cloth screen; flag-OFF -> the vanilla
+        // block-era screen (moved to :common this stage).
+        container.registerExtensionPoint(IConfigScreenFactory.class,
+            (modContainer, parent) -> EntityPortalsFlag.isOn()
+                ? qouteall.imm_ptl.core.platform_specific.IPConfigGUI.createClothConfigScreen(parent)
+                : new SeamlessConfigScreen(parent));
+
+        // ★ SEAM OCCUPANCY RECEIVER — UNCONDITIONAL, deliberately ABOVE the flag branch (the
+        // exact Fabric placement + rationale: the seam is a flag-ON feature, so its receiver
+        // cannot live in the flag-OFF handler set; harmless flag-OFF — occupancy never
+        // arrives). Routed through the PlatformHelper seam: the NF payload-drain dispatcher
+        // already hops handlers onto the client main thread (context.enqueueWork), matching
+        // Fabric's context.client().execute threading. NF-PARITY 2026-08-30.
+        com.warwa.seamlessportals.network.PlatformHelper.getInstance().registerClientPayloadHandler(
+            com.warwa.seamlessportals.network.ModPayloads.SeamOccupancyPayload.TYPE,
+            (payload, client) -> com.warwa.seamlessportals.passthrough.SeamOccupancyClient.apply(
+                payload.dimensionId(), payload.packedPos(), (byte) payload.mask(),
+                payload.secondaryStateId(), (byte) payload.secondaryHalf()));
+        // ★ PENDING flush driver (the live-relog fix, Fabric twin): the JOIN burst lands before
+        // the joining client's level exists and parks in the PENDING stash — which would
+        // otherwise only drain on the NEXT packet, i.e. never after a quiet relog. One branch
+        // per tick when empty.
+        NeoForge.EVENT_BUS.addListener((ClientTickEvent.Post event) ->
+            com.warwa.seamlessportals.passthrough.SeamOccupancyClient.flushPendingTick());
+
+        if (SeamlessPortalsConfig.isEntityPortals()) {
+            // ===== WIRE 3: flag-ON render DISPATCH ========================================
+            // Byte-mirrors SeamlessPortalsClientFabric's AFTER_TRANSLUCENT_TERRAIN driver,
+            // including the census witness and the re-entrancy guard (LOAD-BEARING: a layer-0
+            // nested render would otherwise recurse — see the Fabric driver's TP-XDIM note).
+            // 26.3: NeoForge now posts this event INSIDE vanilla's open "Main" render pass and hands it over
+            // (RenderLevelStageEvent.AfterTranslucentBlocks#getRenderPass); on 26.2 no pass was open here. The portal driver
+            // opens passes, clears and copies, which the 26.3 front end refuses while a pass is open — so the listener
+            // first SUSPENDS the event's pass (com.warwa.seamlessportals.render.MainPassSplit, full citation there);
+            // LevelRendererMainPassSplitMixin reopens one before vanilla's next draw. LOWEST = run after every other
+            // mod's listener, which legitimately draws into that pass and must never be handed a closed one;
+            // same-priority listeners still run in registration order, so driver-then-band-painter is preserved.
+            NeoForge.EVENT_BUS.addListener(net.neoforged.bus.api.EventPriority.LOWEST, (RenderLevelStageEvent.AfterTranslucentBlocks event) -> {
+                com.warwa.seamlessportals.render.MainPassSplit.suspend(event.getRenderPass()); // 26.3: see note above
+                com.warwa.seamlessportals.render.TpXdimFrameCensus.noteF1Driver("flagON");
+                if (PortalRendering.isRendering()
+                    || qouteall.imm_ptl.core.render.CrossPortalViewRendering
+                        .isRenderingCrossPortalView()
+                ) {
+                    com.warwa.seamlessportals.render.TpXdimFrameCensus
+                        .noteF1Driver("skipped-reentrant");
+                    return;
+                }
+                Minecraft client = Minecraft.getInstance();
+                // Defensive copy — FrontClipping/ViewAreaRenderer must not mutate the live
+                // cameraRenderState matrix (same read + copy as the Fabric driver).
+                Matrix4f modelView = new Matrix4f(
+                    client.gameRenderer.gameRenderState().levelRenderState
+                        .cameraRenderState.viewRotationMatrix);
+                PortalRenderer.switchToCorrectRenderer();
+                IPCGlobal.renderer.prepareRendering();
+                IPCGlobal.renderer.onBeforeTranslucentRendering(modelView);
+                IPCGlobal.renderer.finishRendering();
+            });
+            // ENGINE STAGE 2b — the band painter's hook (Fabric twin, NF-PARITY 2026-08-30):
+            // the SECOND AfterTranslucentBlocks registration, immediately after the portal
+            // driver's — the NF bus invokes same-priority listeners in registration order, so
+            // this runs AFTER every portal pass of the frame, and it runs EVERY frame
+            // regardless of whether any pass executed (the design PROHIBITS the doRenderPortal
+            // epilogue). Thin timing driver only; all logic is common-side.
+            NeoForge.EVENT_BUS.addListener(net.neoforged.bus.api.EventPriority.LOWEST, (RenderLevelStageEvent.AfterTranslucentBlocks event) -> {
+                com.warwa.seamlessportals.render.MainPassSplit.suspend(event.getRenderPass()); // 26.3: pass-free (see the driver's note); idempotent
+                qouteall.imm_ptl.core.render.SeamBandPainter.onAfterPortalPasses();
+            });
+            // The BEFORE_TRANSLUCENT_TERRAIN clip-bracket + seam-clip sites have NO NeoForge
+            // event in the gap — driven by the NEOFORGE_ONLY mixin
+            // MixinLevelRenderer_ClipBracketMainPassNeoForge instead (W21), which calls BOTH
+            // in Fabric's registration order (PerEntityClipBracket, then SeamClipRenderer).
+            // ===== SEAM DEST-END AMBIENCE (stitched-space contract item 3) — Fabric twin. ====
+            // Same-dim portal destinations are display-tick dead by construction (vanilla
+            // samples ±31 blocks around the PLAYER); this display-ticks nearby mirrorable
+            // portals' dest regions with the camera-distance gate defeated. ClientTickEvent
+            // .Post = the END_CLIENT_TICK slot (after vanilla's animateTick + engine tick);
+            // queued spawns drain next engine tick. Logic is common-side (SeamDestAmbience).
+            NeoForge.EVENT_BUS.addListener((ClientTickEvent.Post event) ->
+                com.warwa.seamlessportals.render.SeamDestAmbience.tick(Minecraft.getInstance()));
+        } else {
+            // ===== BLOCK-ERA client driver set (flag-OFF, the legacy opt-out) =============
+            // The stencil composite + per-tick pumps, mirroring Fabric's else-branch (same
+            // :common bodies). KNOWN DEVIATION (recorded): the block-era client payload
+            // HANDLERS remain Fabric-only — see the server class's flag-OFF note.
+            // 26.3: pass-free + LOWEST, same reason as the flag-ON driver above (MainPassSplit).
+            NeoForge.EVENT_BUS.addListener(net.neoforged.bus.api.EventPriority.LOWEST, (RenderLevelStageEvent.AfterTranslucentBlocks event) -> {
+                com.warwa.seamlessportals.render.MainPassSplit.suspend(event.getRenderPass());
+                com.warwa.seamlessportals.render.TpXdimFrameCensus.noteF1Driver("stencil");
+                StencilPortalRenderer.renderPortals();
+            });
+
+            NeoForge.EVENT_BUS.addListener((ClientTickEvent.Post event) -> {
+                com.warwa.seamlessportals.render.PerfTimers.time("drainChunks",
+                    com.warwa.seamlessportals.chunk.RedirectedPacketApplier::drainPending);
+                com.warwa.seamlessportals.render.PerfTimers.time("advanceCompilePipelines",
+                    com.warwa.seamlessportals.client.PortalWorldManager::advanceCompilePipelines);
+                com.warwa.seamlessportals.render.PerfTimers.time("syncTime",
+                    com.warwa.seamlessportals.client.PortalWorldManager::syncTimeToCachedLevels);
+                com.warwa.seamlessportals.render.PerfTimers.time("tickRemoteWorlds",
+                    com.warwa.seamlessportals.client.PortalWorldManager::tickRemoteWorlds);
+                com.warwa.seamlessportals.render.PerfTimers.time("tickCachedParticles",
+                    com.warwa.seamlessportals.client.PortalWorldManager::tickCachedParticles);
+                com.warwa.seamlessportals.render.PerfTimers.time("evictUnboundedStores",
+                    com.warwa.seamlessportals.client.PortalWorldManager::evictUnboundedStores);
+            });
+
+            SeamlessPortalsConstants.LOGGER.info(
+                "Seamless Portals: Registered AfterTranslucentBlocks stencil render hook (NeoForge)");
+        }
+    }
+
+    private void onClientSetup(FMLClientSetupEvent event) {
+        if (!SeamlessPortalsConfig.isEntityPortals()) {
+            return;
+        }
+        // ===== ENTITY-PORTAL client init — the exact Fabric order, on the main thread ======
+        // FMLClientSetupEvent is parallel-dispatch; enqueueWork serializes onto the main
+        // thread (we are inside Minecraft.<init> at :719 — mc.getInstance() is non-null,
+        // matching Fabric's mid-ctor client-entrypoint window).
+        event.enqueueWork(() -> {
+            qouteall.q_misc_util.ImplRemoteProcedureCall.initClient();
+            qouteall.q_misc_util.MiscNetworking.initClient();
+            qouteall.imm_ptl.core.IPModMainClient.init();
+            qouteall.imm_ptl.peripheral.PeripheralModMain.initClient();
+            // AFTER IPModMainClient.init (IPConfig loaded) so the force wins over the
+            // config-derived renderMode — the same ordering contract as Fabric.
+            RenderCompatGating.detectAndGateRenderCompat();
+            SeamlessPortalsConstants.LOGGER.info(
+                "Seamless Portals: entity-portal engine initialized (NeoForge client); "
+                    + "flag-ON render dispatch registered (AfterTranslucentBlocks)");
+        });
+    }
+}

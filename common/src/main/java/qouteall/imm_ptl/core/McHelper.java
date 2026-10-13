@@ -1,0 +1,1072 @@
+package qouteall.imm_ptl.core;
+
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.mojang.logging.LogUtils;
+import com.mojang.serialization.Codec;
+import com.mojang.serialization.DataResult;
+import com.mojang.serialization.DynamicOps;
+import com.mojang.serialization.JsonOps;
+import net.minecraft.util.Util;
+import net.minecraft.client.Minecraft;
+import net.minecraft.commands.CommandSource;
+import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.commands.Commands;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.SectionPos;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.network.chat.ClickEvent;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.MutableComponent;
+import net.minecraft.network.protocol.Packet;
+import net.minecraft.network.protocol.game.ClientGamePacketListener;
+import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ChunkHolder;
+import net.minecraft.server.level.ChunkMap;
+import net.minecraft.server.level.ServerChunkCache;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.permissions.LevelBasedPermissionSet;
+import net.minecraft.server.permissions.PermissionSet;
+import net.minecraft.util.AbortableIterationConsumer;
+import net.minecraft.util.Mth;
+import net.minecraft.util.ProblemReporter;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntitySpawnReason;
+import net.minecraft.world.entity.InterpolationHandler;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.LevelAccessor;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.entity.EntitySectionStorage;
+import net.minecraft.world.level.entity.EntityTypeTest;
+import net.minecraft.world.level.entity.LevelEntityGetter;
+import net.minecraft.world.level.storage.LevelStorageSource;
+import net.minecraft.world.level.storage.TagValueInput;
+import net.minecraft.world.level.storage.TagValueOutput;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.shapes.VoxelShape;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.Validate;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import qouteall.imm_ptl.core.compat.GravityChangerInterface;
+import qouteall.imm_ptl.core.ducks.IEChunkMap;
+import qouteall.imm_ptl.core.ducks.IEEntity;
+import qouteall.imm_ptl.core.ducks.IEEntityTrackingSection;
+import qouteall.imm_ptl.core.ducks.IESectionedEntityCache;
+import qouteall.imm_ptl.core.ducks.IEWorld;
+import qouteall.imm_ptl.core.mc_utils.MyNbtTextFormatter;
+import qouteall.imm_ptl.core.mc_utils.ServerTaskList;
+import qouteall.imm_ptl.core.miscellaneous.IPVanillaCopy;
+import qouteall.imm_ptl.core.mixin.common.mc_util.IELevelEntityGetterAdapter;
+import qouteall.imm_ptl.core.platform_specific.O_O;
+import qouteall.imm_ptl.core.portal.Portal;
+import qouteall.q_misc_util.Helper;
+import qouteall.q_misc_util.MiscHelper;
+import qouteall.q_misc_util.my_util.DQuaternion;
+import qouteall.q_misc_util.my_util.IntBox;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
+import java.nio.charset.Charset;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.IntPredicate;
+import java.util.function.Predicate;
+import java.util.stream.Stream;
+
+// mc related helper methods
+public class McHelper {
+    
+    private static final Logger LOGGER = LogUtils.getLogger();
+    
+    public static class Placeholder {}
+    
+    public static final Placeholder placeholder = new Placeholder();
+    
+    public static Identifier newResourceLocation(String a, String b) {
+        return Identifier.fromNamespaceAndPath(a, b);
+    }
+    
+    public static Identifier newResourceLocation(String a) {
+        return Identifier.parse(a);
+    }
+    
+    @Deprecated
+    public static IEChunkMap getIEChunkMap(ResourceKey<Level> dimension) {
+        return (IEChunkMap) (
+            (ServerChunkCache) getServerWorld(dimension).getChunkSource()
+        ).chunkMap;
+    }
+    
+    @Deprecated
+    public static List<ServerPlayer> getRawPlayerList() {
+        return MiscHelper.getServer().getPlayerList().getPlayers();
+    }
+    
+    public static Vec3 lastTickPosOf(Entity entity) {
+        return new Vec3(entity.xo, entity.yo, entity.zo);
+    }
+    
+    @Deprecated
+    public static ServerLevel getOverWorldOnServer() {
+        return MiscHelper.getServer().getLevel(Level.OVERWORLD);
+    }
+    
+    public static void serverLog(
+        ServerPlayer player,
+        String text
+    ) {
+        Helper.log(text);
+        player.sendSystemMessage(Component.literal(text));
+    }
+    
+    public static long getServerGameTime() {
+        return getOverWorldOnServer().getGameTime();
+    }
+    
+    public static <T> void performMultiThreadedFindingTaskOnServer(
+        MinecraftServer server,
+        Stream<T> stream,
+        Predicate<T> predicate,
+        IntPredicate taskWatcher,//return false to abort the task
+        Consumer<T> onFound,
+        Runnable onNotFound,
+        Runnable finalizer
+    ) {
+        int[] progress = new int[1];
+        Helper.SimpleBox<Boolean> isAborted = new Helper.SimpleBox<>(false);
+        Helper.SimpleBox<Runnable> finishBehavior = new Helper.SimpleBox<>(() -> {
+            Helper.err("Error Occured");
+        });
+        CompletableFuture<Void> future = CompletableFuture.runAsync(
+            () -> {
+                try {
+                    T result = stream.peek(
+                        obj -> {
+                            progress[0] += 1;
+                        }
+                    ).filter(
+                        predicate
+                    ).findFirst().orElse(null);
+                    if (result != null) {
+                        finishBehavior.obj = () -> onFound.accept(result);
+                    }
+                    else {
+                        finishBehavior.obj = onNotFound;
+                    }
+                }
+                catch (Throwable t) {
+                    t.printStackTrace();
+                    finishBehavior.obj = () -> {
+                        t.printStackTrace();
+                    };
+                }
+            },
+            Util.backgroundExecutor()
+        );
+        ServerTaskList.of(server).addTask(() -> {
+            if (future.isDone()) {
+                if (!isAborted.obj) {
+                    finishBehavior.obj.run();
+                    finalizer.run();
+                }
+                else {
+                    Helper.log("Future done but the task is aborted");
+                }
+                return true;
+            }
+            if (future.isCancelled()) {
+                Helper.err("The future is cancelled");
+                finalizer.run();
+                return true;
+            }
+            if (future.isCompletedExceptionally()) {
+                Helper.err("The future is completed exceptionally");
+                finalizer.run();
+                return true;
+            }
+            boolean shouldContinue = taskWatcher.test(progress[0]);
+            if (!shouldContinue) {
+                isAborted.obj = true;
+                future.cancel(true);
+                finalizer.run();
+                return true;
+            }
+            else {
+                return false;
+            }
+        });
+    }
+    
+    public static <ENTITY extends Entity> List<ENTITY> getEntitiesNearby(
+        Level world,
+        Vec3 center,
+        Class<ENTITY> entityClass,
+        double range
+    ) {
+        return findEntitiesRough(
+            entityClass,
+            world,
+            center,
+            (int) (range / 16 + 1),
+            e -> true
+        );
+    }
+    
+    public static <ENTITY extends Entity> List<ENTITY> getEntitiesNearby(
+        Entity center,
+        Class<ENTITY> entityClass,
+        double range
+    ) {
+        return getEntitiesNearby(
+            center.level(),
+            center.position(),
+            entityClass,
+            range
+        );
+    }
+    
+    public static int getLoadDistanceOnServer(MinecraftServer server) {
+        return server.getPlayerList().getViewDistance();
+    }
+    
+    /**
+     * {@link ChunkMap#getPlayerViewDistance(ServerPlayer)}
+     */
+    @SuppressWarnings("JavadocReference")
+    @IPVanillaCopy
+    public static int getPlayerLoadDistance(ServerPlayer player) {
+        assert player.level().getServer() != null;
+        int loadDistanceOnServer = getLoadDistanceOnServer(player.level().getServer());
+        return Mth.clamp(player.requestedViewDistance(), 2, loadDistanceOnServer);
+    }
+    
+    public static void setPosAndLastTickPos(
+        Entity entity,
+        Vec3 pos,
+        Vec3 lastTickPos
+    ) {
+        entity.setPosRaw(pos.x, pos.y, pos.z);
+        entity.xOld = lastTickPos.x;
+        entity.yOld = lastTickPos.y;
+        entity.zOld = lastTickPos.z;
+        entity.xo = lastTickPos.x;
+        entity.yo = lastTickPos.y;
+        entity.zo = lastTickPos.z;
+    }
+    
+    public static void setPosAndLastTickPosWithoutTriggeringCallback(
+        Entity entity,
+        Vec3 pos,
+        Vec3 lastTickPos
+    ) {
+        ((IEEntity) entity).ip_setPositionWithoutTriggeringCallback(pos);
+        entity.xOld = lastTickPos.x;
+        entity.yOld = lastTickPos.y;
+        entity.zOld = lastTickPos.z;
+        entity.xo = lastTickPos.x;
+        entity.yo = lastTickPos.y;
+        entity.zo = lastTickPos.z;
+    }
+    
+    public static Vec3 getEyePos(Entity entity) {
+        Vec3 eyeOffset = GravityChangerInterface.invoker.getEyeOffset(entity);
+        return entity.position().add(eyeOffset);
+    }
+    
+    public static Vec3 getLastTickEyePos(Entity entity) {
+        Vec3 eyeOffset = GravityChangerInterface.invoker.getEyeOffset(entity);
+        return lastTickPosOf(entity).add(eyeOffset);
+    }
+    
+    public static void setEyePos(Entity entity, Vec3 eyePos, Vec3 lastTickEyePos) {
+        Vec3 eyeOffset = GravityChangerInterface.invoker.getEyeOffset(entity);
+        
+        setPosAndLastTickPos(
+            entity,
+            eyePos.subtract(eyeOffset),
+            lastTickEyePos.subtract(eyeOffset)
+        );
+    }
+    
+    /**
+     * {@link Entity#positionRider(Entity)}
+     * TODO fix for non-default gravity
+     */
+    /**
+     * The vector to add to a PASSENGER's position to get where its VEHICLE must sit — the exact
+     * inverse of vanilla's own rider placement.
+     *
+     * <p>RS (d) FIX, 2026-07-28, user-authorised. {@code Entity.positionRider} (26.2 Entity:2380)
+     * places a rider at
+     * {@code vehicle.getPassengerRidingPosition(passenger) - passenger.getVehicleAttachmentPoint(vehicle)},
+     * and {@code getPassengerRidingPosition} is the vehicle's position PLUS the vehicle's own
+     * passenger-attachment offset. Inverting that needs BOTH terms:
+     * <pre>  vehiclePos = passengerPos + passengerVehicleAttach - vehiclePassengerAttach</pre>
+     * This method previously returned only the first attachment, dropping the second — so every
+     * ridden vehicle carried through a portal was placed too HIGH by the vehicle's own passenger
+     * offset. Measured on a minecart: the rider's real offset from the cart is 0.4125, the
+     * returned attachment was 0.6, and every ridden arrival landed 0.1875 above rail riding
+     * height (user's live round, 2026-07-28: {@code y=…250} instead of {@code …063}, five out of
+     * five, both directions, cross-dim and same-dim alike). The cart then fell back onto the rail,
+     * which is why it read as a small hop rather than a break.
+     *
+     * <p>Not minecart-specific: the same omission shifted boats, horses and every other ridden
+     * vehicle by their own attachment offsets. Computed from the live entities rather than
+     * hard-coded, so it stays correct for entity types with different attachments.
+     */
+    public static Vec3 getVehicleOffsetFromPassenger(Entity vehicle, Entity passenger) {
+        Vec3 passengerVehicleAttach = passenger.getVehicleAttachmentPoint(vehicle);
+        if (com.warwa.seamlessportals.passthrough.AperturePassthroughLever
+            .DISABLE_SEAM_VEHICLE_ATTACH) {
+            return passengerVehicleAttach;   // lever: the pre-fix one-term offset
+        }
+        Vec3 vehiclePassengerAttach =
+            vehicle.getPassengerRidingPosition(passenger).subtract(vehicle.position());
+
+        return passengerVehicleAttach.subtract(vehiclePassengerAttach);
+    }
+    
+    public static void adjustVehicle(Entity entity) {
+        Entity vehicle = entity.getVehicle();
+        if (vehicle == null) {
+            return;
+        }
+        
+        Vec3 vehicleOffset = getVehicleOffsetFromPassenger(vehicle, entity);
+        
+        Vec3 currVelocity = vehicle.getDeltaMovement();
+        
+        Vec3 newVehiclePos = entity.position().add(vehicleOffset);
+        Vec3 newVehicleLastTickPos = McHelper.lastTickPosOf(entity).add(vehicleOffset);
+        
+        // minecarts, boats and LivingEntity use position interpolation
+        // don't make interpolate, or it may interpolate into unloaded chunks
+        vehicle.setPos(newVehiclePos.x(), newVehiclePos.y(), newVehiclePos.z());
+        InterpolationHandler vehicleInterpolation = vehicle.getInterpolation();
+        if (vehicleInterpolation != null) {
+            vehicleInterpolation.cancel();
+        }
+        
+        McHelper.setPosAndLastTickPos(
+            vehicle, newVehiclePos, newVehicleLastTickPos
+        );
+
+        // (e) DEFECT B, SAME-DIM ARM — rebase the relative-move codec here too.
+        //
+        // This is the SAME-DIM carry site, and it is the one the cross-dim fix in
+        // moveClientEntityAcrossDimension does not reach: a same-dimension crossing never calls
+        // that method (ClientTeleportationManager.teleportPlayer gates it on
+        // fromDimension != toDimension), so the identical stale-base defect survived there.
+        //
+        // The cancel() above was already right and was already necessary — but it is not
+        // sufficient, because it only clears the interpolation that exists AT THIS INSTANT.
+        // Without a rebase, the next ClientboundMoveEntityPacket$Pos decodes its deltas against a
+        // VecDeltaCodec base from BEFORE the 40,000-block carry, and the resulting garbage position
+        // re-arms the interpolation that was just cancelled.
+        //
+        // Measured 2026-08-01, same-dim ridden crossing, cart id=1422:
+        //   t+464  adjustVehicle carries the cart to (10.87, 19.06, 40000.5)      [correct]
+        //   t+464  InterpolationHandler.interpolate -> (-33.20, 4.40, 53360.83)   [garbage]
+        //   t+466  Entity.snapTo (position sync) -> (149.07, 63.06, -80.5)
+        //   t+466  InterpolationHandler.interpolate -> (103.80, 48.40, 13279.83)
+        //   t+480..t+542  player FROZEN at (103.80, 47.98, 13279.83), mid-air, 13k blocks along
+        //                 the line between the two portal endpoints, until they used /kill.
+        // The player/vehicle delta stayed exactly (0, 0.4125, 0) throughout — the ride was never
+        // broken and no dismount was involved. The rider was simply carried to a nonsense
+        // interpolated position and stranded there.
+        //
+        // CLIENT ONLY, and the gate is meaning rather than safety. adjustVehicle runs on BOTH
+        // sides, but syncPacketPositionCodec writes Entity.packetPositionCodec, which is
+        // client-DECODE state: 26.2's ServerEntity keeps its own private VecDeltaCodec and never
+        // reads this one (javap; the only readers of Entity.getPositionCodec are
+        // ClientPacketListener and Entity itself). The server-side call was therefore inert — it
+        // read as if it did something and did not. The server needs no equivalent: when a carry
+        // pushes its own encoded delta outside the packet's short range, ServerEntity.sendChanges
+        // falls back to an absolute ClientboundEntityPositionSyncPacket by itself.
+        if (vehicle.level().isClientSide()
+            && !com.warwa.seamlessportals.passthrough.AperturePassthroughLever
+                .DISABLE_CROSS_DIM_POSITION_CODEC_SYNC) {
+            vehicle.syncPacketPositionCodec(
+                newVehiclePos.x(), newVehiclePos.y(), newVehiclePos.z());
+        }
+        // Latch the base drift HERE, at the carry. Read post-hoc it is meaningless — vanilla
+        // rebases the codec on every position packet — and a gate that sampled it 30 ticks later
+        // reported "the lever is dead code" while the defect was reproducing in the same run.
+        com.warwa.seamlessportals.passthrough.SeamRideProbe.recordCarryBaseDrift(
+            vehicle, newVehiclePos.x(), newVehiclePos.y(), newVehiclePos.z());
+
+        vehicle.setDeltaMovement(currVelocity);
+
+    }
+    
+    public static LevelChunk getServerChunkIfPresent(
+        ResourceKey<Level> dimension,
+        int x, int z
+    ) {
+        ChunkHolder chunkHolder_ = getIEChunkMap(dimension).ip_getChunkHolder(ChunkPos.pack(x, z));
+        if (chunkHolder_ == null) {
+            return null;
+        }
+        return chunkHolder_.getTickingChunk();
+    }
+    
+    public static LevelChunk getServerChunkIfPresent(
+        ServerLevel world, int x, int z
+    ) {
+        ChunkHolder chunkHolder_ = ((IEChunkMap) (
+            (ServerChunkCache) world.getChunkSource()
+        ).chunkMap).ip_getChunkHolder(ChunkPos.pack(x, z));
+        if (chunkHolder_ == null) {
+            return null;
+        }
+        return chunkHolder_.getTickingChunk();
+    }
+    
+    @Deprecated
+    public static <ENTITY extends Entity> Stream<ENTITY> getServerEntitiesNearbyWithoutLoadingChunk(
+        Level world,
+        Vec3 center,
+        Class<ENTITY> entityClass,
+        double range
+    ) {
+        return McHelper.findEntitiesRough(
+            entityClass,
+            world,
+            center,
+            (int) (range / 16),
+            e -> true
+        ).stream();
+    }
+    
+    public static void updateBoundingBox(Entity player) {
+        player.setPos(player.getX(), player.getY(), player.getZ());
+    }
+    
+    public static void updatePosition(Entity entity, Vec3 pos) {
+        entity.setPos(pos.x, pos.y, pos.z);
+    }
+    
+    public static <T extends Entity> List<T> getEntitiesRegardingLargeEntities(
+        Level world,
+        AABB box,
+        double maxEntitySizeHalf,
+        Class<T> entityClass,
+        Predicate<T> predicate
+    ) {
+        return findEntitiesByBox(
+            entityClass,
+            world,
+            box,
+            maxEntitySizeHalf,
+            predicate
+        );
+    }
+    
+    
+    public static Portal copyEntity(Portal portal) {
+        Portal newPortal = ((Portal) portal.getType().create(portal.level(), EntitySpawnReason.LOAD));
+        
+        Validate.notNull(newPortal);
+        
+        TagValueOutput output = TagValueOutput.createWithContext(
+            ProblemReporter.DISCARDING, portal.registryAccess()
+        );
+        portal.saveWithoutId(output);
+        newPortal.load(TagValueInput.create(
+            ProblemReporter.DISCARDING, portal.registryAccess(), output.buildResult()
+        ));
+        return newPortal;
+    }
+    
+    /**
+     * {@link net.minecraft.world.level.chunk.storage.RegionFileStorage}
+     * MC does not provide a clean interface to tell whether a chunk exists.
+     * Only check whether the region file exists now.
+     */
+    public static boolean getDoesRegionFileExist(ResourceKey<Level> toDimension, BlockPos toPos) {
+        ChunkPos chunkPos = new ChunkPos(
+            SectionPos.blockToSectionCoord(toPos.getX()),
+            SectionPos.blockToSectionCoord(toPos.getZ())
+        );
+        
+        LevelStorageSource.LevelStorageAccess storageSource = MiscHelper.getServer().storageSource;
+        
+        Path regionFilePath = storageSource.getDimensionPath(toDimension).resolve("region")
+            .resolve("r." + chunkPos.getRegionX() + "." + chunkPos.getRegionZ() + ".mca");
+        
+        return regionFilePath.toFile().exists();
+    }
+    
+    public static MutableComponent getLinkText(String link) {
+        return Component.literal(link).withStyle(
+            style -> style.withClickEvent(new ClickEvent.OpenUrl(
+                URI.create(link)
+            )).withUnderlined(true)
+        );
+    }
+    
+    public static void validateOnServerThread() {
+        Validate.isTrue(Thread.currentThread() == MiscHelper.getServer().getRunningThread(), "must be on server thread");
+    }
+    
+    public static void invokeCommandAs(Entity commandSender, List<String> commandList) {
+        CommandSourceStack commandSource = new CommandSourceStack(
+            CommandSource.NULL,
+            commandSender.position(),
+            commandSender.getRotationVector(),
+            (ServerLevel) commandSender.level(),
+            PermissionSet.NO_PERMISSIONS,
+            // 26.3: the (…, String textName, Component displayName, …) ctor is gone; the public
+            // 7-arg form derives both through NamesProvider.FOR_ENTITY (mc263-ref
+            // CommandSourceStack.java:68-72,584-594): displayName = entity.getDisplayName(),
+            // textName = entity.getPlainTextName() = getName().getString() (Nameable.java:9) — the
+            // exact two values passed here before. Vanilla's own Entity site dropped the same two
+            // args (mc262-ref Entity.java:3617 -> mc263-ref :3756).
+            ((ServerLevel) commandSender.level()).getServer(),
+            commandSender
+        ).withPermission(LevelBasedPermissionSet.GAMEMASTER).withSuppressedOutput();
+        MinecraftServer server = ((ServerLevel) commandSender.level()).getServer();
+        assert server != null;
+        Commands commandManager = server.getCommands();
+        
+        for (String command : commandList) {
+            commandManager.performPrefixedCommand(commandSource, command);
+        }
+    }
+    
+    public static void resendSpawnPacketToTrackers(Entity entity) {
+        getIEChunkMap(entity.level().dimension()).ip_resendSpawnPacketToTrackers(entity);
+    }
+    
+    public static void sendToTrackers(Entity entity, Packet<?> packet) {
+        ChunkMap.TrackedEntity entityTracker =
+            getIEChunkMap(entity.level().dimension()).ip_getEntityTrackerMap().get(entity.getId());
+        if (entityTracker == null) {
+//            Helper.err("missing entity tracker object");
+            return;
+        }
+        
+        entityTracker.sendToTrackingPlayersAndSelf(
+            (Packet<? super ClientGamePacketListener>) packet
+        );
+    }
+    
+    //it's a little bit incorrect with corner glass pane
+    @Nullable
+    public static AABB getWallBox(Level world, IntBox glassArea) {
+        Stream<BlockPos> blockPosStream = glassArea.stream();
+        return getWallBox(world, blockPosStream);
+    }
+    
+    @Nullable
+    public static AABB getWallBox(Level world, Stream<BlockPos> blockPosStream) {
+        return blockPosStream.map(blockPos -> {
+            VoxelShape collisionShape = world.getBlockState(blockPos).getCollisionShape(world, blockPos);
+            
+            if (collisionShape.isEmpty()) {
+                return null;
+            }
+            
+            return collisionShape.bounds().move(Vec3.atLowerCornerOf(blockPos));
+        }).filter(b -> b != null).reduce(AABB::minmax).orElse(null);
+    }
+    
+    
+    public static boolean isServerChunkFullyLoaded(ServerLevel world, ChunkPos chunkPos) {
+        LevelChunk chunk = getServerChunkIfPresent(
+            world.dimension(), chunkPos.x(), chunkPos.z()
+        );
+        
+        if (chunk == null) {
+            return false;
+        }
+        
+        boolean entitiesLoaded = world.areEntitiesLoaded(chunkPos.pack());
+        
+        return entitiesLoaded;
+    }
+    
+    public static interface ChunkAccessor {
+        LevelChunk getChunk(int x, int z);
+    }
+    
+    public static ChunkAccessor getChunkAccessor(Level world) {
+        if (world.isClientSide()) {
+            return world::getChunk;
+        }
+        else {
+            return (x, z) -> getServerChunkIfPresent(((ServerLevel) world), x, z);
+        }
+    }
+    
+    public static <T extends Entity> List<T> findEntities(
+        Class<T> entityClass,
+        LevelEntityGetter<Entity> entityLookup,
+        int chunkXStart,
+        int chunkXEnd,
+        int chunkYStart,
+        int chunkYEnd,
+        int chunkZStart,
+        int chunkZEnd,
+        Predicate<T> predicate
+    ) {
+        ArrayList<T> result = new ArrayList<>();
+        
+        foreachEntities(
+            entityClass, entityLookup,
+            chunkXStart, chunkXEnd, chunkYStart, chunkYEnd, chunkZStart, chunkZEnd,
+            entity -> {
+                if (predicate.test(entity)) {
+                    result.add(entity);
+                }
+            }
+        );
+        return result;
+    }
+    
+    @Nullable
+    public static <T extends Entity, R> R traverseEntities(
+        Class<T> entityClass, LevelEntityGetter<Entity> entityLookup,
+        int chunkXStart, int chunkXEnd,
+        int chunkYStart, int chunkYEnd,
+        int chunkZStart, int chunkZEnd,
+        Function<T, R> function
+    ) {
+        Validate.isTrue(chunkXEnd >= chunkXStart);
+        Validate.isTrue(chunkYEnd >= chunkYStart);
+        Validate.isTrue(chunkZEnd >= chunkZStart);
+        Validate.isTrue(chunkXEnd - chunkXStart < 1000, "range too big");
+        Validate.isTrue(chunkZEnd - chunkZStart < 1000, "range too big");
+        
+        EntityTypeTest<Entity, T> typeFilter = EntityTypeTest.forClass(entityClass);
+        
+        EntitySectionStorage<Entity> cache =
+            (EntitySectionStorage<Entity>) ((IELevelEntityGetterAdapter) entityLookup).getCache();
+        
+        return ((IESectionedEntityCache<Entity>) cache).ip_traverseSectionInBox(
+            chunkXStart, chunkXEnd,
+            chunkYStart, chunkYEnd,
+            chunkZStart, chunkZEnd,
+            entityTrackingSection -> {
+                return ((IEEntityTrackingSection<Entity>) entityTrackingSection).ip_traverse(
+                    typeFilter, function
+                );
+            }
+        );
+    }
+    
+    public static <E extends Entity, R> R traverseEntitiesByBox(
+        Class<E> entityClass,
+        Level world,
+        AABB box,
+        double maxEntityRadius,
+        Function<E, R> function
+    ) {
+        return traverseEntitiesByApproximateRegion(
+            entityClass, world, box,
+            maxEntityRadius,
+            entity -> {
+                if (entity.getBoundingBox().intersects(box)) {
+                    return function.apply(entity);
+                }
+                else {
+                    return null;
+                }
+            }
+        );
+    }
+    
+    /**
+     * the range is inclusive on both ends
+     * similar to {@link EntitySectionStorage#forEachAccessibleNonEmptySection(AABB, AbortableIterationConsumer)}
+     * but without hardcoding the max entity radius
+     */
+    public static <T extends Entity> void foreachEntities(
+        Class<T> entityClass, LevelEntityGetter<Entity> entityLookup,
+        int chunkXStart, int chunkXEnd,
+        int chunkYStart, int chunkYEnd,
+        int chunkZStart, int chunkZEnd,
+        Consumer<T> consumer
+    ) {
+        traverseEntities(
+            entityClass, entityLookup,
+            chunkXStart, chunkXEnd,
+            chunkYStart, chunkYEnd,
+            chunkZStart, chunkZEnd,
+            e -> {
+                consumer.accept(e);
+                return null;
+            }
+        );
+    }
+    
+    public static <T extends Entity> List<T> findEntitiesRough(
+        Class<T> entityClass,
+        Level world,
+        Vec3 center,
+        int radiusChunks,
+        Predicate<T> predicate
+    ) {
+        // the minimum is 1
+        if (radiusChunks <= 0) {
+            radiusChunks = 1;
+        }
+        
+        if (radiusChunks > 32) {
+            radiusChunks = 32;
+        }
+        
+        SectionPos sectionPos = SectionPos.of(center);
+        
+        return findEntities(
+            entityClass,
+            ((IEWorld) world).portal_getEntityLookup(),
+            sectionPos.x() - radiusChunks,
+            sectionPos.x() + radiusChunks,
+            sectionPos.y() - radiusChunks,
+            sectionPos.y() + radiusChunks,
+            sectionPos.z() - radiusChunks,
+            sectionPos.z() + radiusChunks,
+            predicate
+        );
+    }
+    
+    //does not load chunk on server and works with large entities
+    public static <T extends Entity> List<T> findEntitiesByBox(
+        Class<T> entityClass,
+        Level world,
+        AABB box,
+        double maxEntityRadius,
+        Predicate<T> predicate
+    ) {
+        ArrayList<T> result = new ArrayList<>();
+        
+        foreachEntitiesByBox(entityClass, world, box, maxEntityRadius, predicate, result::add);
+        return result;
+    }
+    
+    public static <T extends Entity> void foreachEntitiesByBox(
+        Class<T> entityClass, Level world, AABB box,
+        double maxEntityRadius, Predicate<T> predicate, Consumer<T> consumer
+    ) {
+        
+        foreachEntitiesByBoxApproximateRegions(entityClass, world, box, maxEntityRadius, entity -> {
+            if (entity.getBoundingBox().intersects(box) && predicate.test(entity)) {
+                consumer.accept(entity);
+            }
+        });
+    }
+    
+    public static <T extends Entity> void foreachEntitiesByBoxApproximateRegions(
+        Class<T> entityClass, Level world, AABB box, double maxEntityRadius, Consumer<T> consumer
+    ) {
+        int xMin = (int) Math.floor(box.minX - maxEntityRadius);
+        int yMin = (int) Math.floor(box.minY - maxEntityRadius);
+        int zMin = (int) Math.floor(box.minZ - maxEntityRadius);
+        int xMax = (int) Math.ceil(box.maxX + maxEntityRadius);
+        int yMax = (int) Math.ceil(box.maxY + maxEntityRadius);
+        int zMax = (int) Math.ceil(box.maxZ + maxEntityRadius);
+        
+        
+        foreachEntities(
+            entityClass, ((IEWorld) world).portal_getEntityLookup(),
+            xMin >> 4, xMax >> 4,
+            yMin >> 4, yMax >> 4,
+            zMin >> 4, zMax >> 4,
+            consumer
+        );
+    }
+    
+    public static <E extends Entity, R> R traverseEntitiesByApproximateRegion(
+        Class<E> entityClass, Level world, AABB box, double maxEntityRadius,
+        Function<E, R> function
+    ) {
+        int xMin = (int) Math.floor(box.minX - maxEntityRadius);
+        int yMin = (int) Math.floor(box.minY - maxEntityRadius);
+        int zMin = (int) Math.floor(box.minZ - maxEntityRadius);
+        int xMax = (int) Math.ceil(box.maxX + maxEntityRadius);
+        int yMax = (int) Math.ceil(box.maxY + maxEntityRadius);
+        int zMax = (int) Math.ceil(box.maxZ + maxEntityRadius);
+        
+        return traverseEntities(
+            entityClass, ((IEWorld) world).portal_getEntityLookup(),
+            xMin >> 4, xMax >> 4,
+            yMin >> 4, yMax >> 4,
+            zMin >> 4, zMax >> 4,
+            function
+        );
+    }
+    
+    public static <T extends Entity> void foreachEntitiesByPointAndRoughRadius(
+        Class<T> entityClass, Level world, Vec3 point, int roughRadius,
+        Consumer<T> consumer
+    ) {
+        traverseEntitiesByPointAndRoughRadius(
+            entityClass, world, point, roughRadius,
+            entity -> {
+                consumer.accept(entity);
+                return null;
+            }
+        );
+    }
+    
+    public static <T extends Entity, R> void traverseEntitiesByPointAndRoughRadius(
+        Class<T> entityClass, Level world, Vec3 point, int roughRadius,
+        Function<T, R> function
+    ) {
+        SectionPos sectionPos = SectionPos.of(BlockPos.containing(point));
+        int roughRadiusChunks = (int) Math.ceil(roughRadius / 16.0);
+        if (roughRadiusChunks == 0) {
+            roughRadiusChunks = 1;
+        }
+        
+        traverseEntities(
+            entityClass, ((IEWorld) world).portal_getEntityLookup(),
+            sectionPos.x() - roughRadiusChunks,
+            sectionPos.x() + roughRadiusChunks,
+            sectionPos.y() - roughRadiusChunks,
+            sectionPos.y() + roughRadiusChunks,
+            sectionPos.z() - roughRadiusChunks,
+            sectionPos.z() + roughRadiusChunks,
+            function
+        );
+    }
+    
+    
+    public static Identifier dimensionTypeId(ResourceKey<Level> dimType) {
+        return dimType.identifier();
+    }
+    
+    public static <T> String serializeToJson(T object, Codec<T> codec) {
+        DataResult<JsonElement> r = codec.encode(object, JsonOps.INSTANCE, new JsonObject());
+        JsonElement result = r.getOrThrow();
+        return IPGlobal.gson.toJson(result);
+    }
+    
+    public static class MyDecodeException extends RuntimeException {
+        
+        public MyDecodeException(String message) {
+            super(message);
+        }
+    }
+    
+    public static <T, Serialized> T decodeFailHard(
+        Codec<T> codec,
+        DynamicOps<Serialized> ops,
+        Serialized target
+    ) {
+        return codec.decode(ops, target)
+            .getOrThrow(s -> {
+                throw new MyDecodeException("Cannot decode" + s + target);
+            }).getFirst();
+    }
+    
+    public static <Serialized> Serialized getElementFailHard(
+        DynamicOps<Serialized> ops,
+        Serialized target,
+        String key
+    ) {
+        return ops.get(target, key).getOrThrow(s -> {
+            throw new MyDecodeException("Cannot find" + key + s + target);
+        });
+    }
+    
+    public static <T, Serialized> void encode(
+        Codec<T> codec,
+        DynamicOps<Serialized> ops,
+        Serialized target,
+        T object
+    ) {
+        codec.encode(object, ops, target);
+    }
+    
+    public static <Serialized, T> T decodeElementFailHard(
+        DynamicOps<Serialized> ops, Serialized input,
+        Codec<T> codec, String key
+    ) {
+        return decodeFailHard(
+            codec, ops,
+            getElementFailHard(ops, input, key)
+        );
+    }
+    
+    public static void sendMessageToFirstLoggedPlayer(
+        MinecraftServer server, Component text
+    ) {
+        LOGGER.info("Message: {}", text.getContents());
+        ServerTaskList.of(server).addTask(() -> {
+            List<ServerPlayer> playerList = server.getPlayerList().getPlayers();
+            if (playerList.isEmpty()) {
+                return false;
+            }
+            
+            for (ServerPlayer player : playerList) {
+                player.sendSystemMessage(text);
+            }
+            
+            return true;
+        });
+    }
+    
+    public static Iterable<Entity> getWorldEntityList(Level world) {
+        if (world.isClientSide()) {
+            return CHelper.getWorldEntityList(world);
+        }
+        else {
+            if (world instanceof ServerLevel) {
+                return ((ServerLevel) world).getAllEntities();
+            }
+            else {
+                return ((Iterable<Entity>) Collections.emptyList().iterator());
+            }
+        }
+    }
+    
+    /**
+     * It will spawn even if the chunk is not loaded
+     */
+    public static void spawnServerEntity(Entity entity) {
+        Validate.isTrue(!entity.level().isClientSide());
+        
+        boolean spawned = entity.level().addFreshEntity(entity);
+        
+        if (!spawned) {
+            LOGGER.error("Failed to spawn {} {}", entity, entity.level());
+        }
+    }
+    
+    @Deprecated
+    public static ServerLevel getServerWorld(ResourceKey<Level> dim) {
+        return getServerWorld(MiscHelper.getServer(), dim);
+    }
+    
+    public static @NotNull ServerLevel getServerWorld(
+        MinecraftServer server, ResourceKey<Level> dim
+    ) {
+        ServerLevel world = server.getLevel(dim);
+        if (world == null) {
+            throw new RuntimeException("Missing dimension " + dim.identifier());
+        }
+        return world;
+    }
+    
+    public static Component compoundTagToTextSorted(CompoundTag tag, String indent, int depth) {
+        return new MyNbtTextFormatter(" ", 0).apply(tag);
+    }
+    
+    public static int getMinY(LevelAccessor world) {
+        return world.getMinY();
+    }
+    
+    public static int getMaxYExclusive(LevelAccessor world) {
+        return world.getMaxY() + 1;
+    }
+    
+    public static int getMaxContentYExclusive(LevelAccessor world) {
+        return world.dimensionType().logicalHeight() + getMinY(world);
+    }
+    
+    public static int getMinSectionY(LevelAccessor world) {
+        return world.getMinSectionY();
+    }
+    
+    public static int getMaxSectionYExclusive(LevelAccessor world) {
+        return world.getMaxSectionY() + 1;
+    }
+    
+    public static int getYSectionNumber(LevelAccessor world) {
+        return getMaxSectionYExclusive(world) - getMinSectionY(world);
+    }
+    
+    public static AABB getBoundingBoxWithMovedPosition(
+        Entity entity, Vec3 newPos
+    ) {
+        return entity.getBoundingBox().move(
+            newPos.subtract(entity.position())
+        );
+    }
+    
+    public static String readTextResource(Identifier identifier) {
+        String result = null;
+        try {
+            InputStream inputStream =
+                Minecraft.getInstance().getResourceManager().getResource(
+                    identifier
+                ).get().open();
+            
+            result = IOUtils.toString(inputStream, Charset.defaultCharset());
+        }
+        catch (IOException e) {
+            throw new RuntimeException("Error loading " + identifier, e);
+        }
+        return result;
+    }
+    
+    public static Vec3 getWorldVelocity(Entity entity) {
+        return GravityChangerInterface.invoker.getWorldVelocity(entity);
+    }
+    
+    public static void setWorldVelocity(Entity entity, Vec3 newVelocity) {
+        GravityChangerInterface.invoker.setWorldVelocity(entity, newVelocity);
+    }
+    
+    public static Vec3 getEyeOffset(Entity entity) {
+        return GravityChangerInterface.invoker.getEyeOffset(entity);
+    }
+    
+    public static Vec3 getAxisWFromOrientation(DQuaternion quaternion) {
+        return quaternion.getAxisW();
+    }
+    
+    public static Vec3 getAxisHFromOrientation(DQuaternion quaternion) {
+        return quaternion.getAxisH();
+    }
+    
+    public static Vec3 getNormalFromOrientation(DQuaternion quaternion) {
+        return quaternion.getNormal();
+    }
+    
+    @Nullable
+    public static Entity getEntityByUUID(Level world, UUID portalId) {
+        return ((IEWorld) world).portal_getEntityLookup().get(portalId);
+    }
+    
+    /**
+     * Firstly try to use translatable `dimension.modid.dimension_id`.
+     * If missing, try to get the mod name and use "a dimension of mod_name" or "a dimension of modid"
+     * TODO possibly infer dimension name from dimension type
+     */
+    public static Component getDimensionName(ResourceKey<Level> dimension) {
+        String namespace = dimension.identifier().getNamespace();
+        String path = dimension.identifier().getPath();
+        String translationkey = "dimension." + namespace + "." + path;
+        MutableComponent component = Component.translatable(translationkey);
+        
+        if (component.getString().equals(translationkey)) {
+            // no translation
+            // try to get the mod name
+            String modName = O_O.getModName(namespace);
+            return Component.translatable(
+                    "imm_ptl.a_dimension_of",
+                    modName != null ? modName : namespace
+                )
+                .append(" (" + dimension.identifier() + ")");
+        }
+        
+        return component;
+    }
+}

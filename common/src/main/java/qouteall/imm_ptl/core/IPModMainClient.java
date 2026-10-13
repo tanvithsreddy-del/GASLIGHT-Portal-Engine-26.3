@@ -1,0 +1,152 @@
+package qouteall.imm_ptl.core;
+
+import com.mojang.brigadier.CommandDispatcher;
+import com.warwa.seamlessportals.platform.ClientPlatform;
+import net.minecraft.ChatFormatting;
+import net.minecraft.client.Minecraft;
+import net.minecraft.network.chat.Component;
+import qouteall.imm_ptl.core.collision.CollisionHelper;
+import qouteall.imm_ptl.core.collision.CollisionHelperClient;
+import qouteall.imm_ptl.core.commands.ClientDebugCommand;
+import qouteall.imm_ptl.core.compat.IPFlywheelCompat;
+import qouteall.imm_ptl.core.compat.sodium_compatibility.SodiumInterface;
+import qouteall.imm_ptl.core.miscellaneous.DubiousThings;
+import qouteall.imm_ptl.core.miscellaneous.GcMonitor;
+import qouteall.imm_ptl.core.network.ImmPtlNetworkConfig;
+import qouteall.imm_ptl.core.network.ImmPtlNetworking;
+import qouteall.imm_ptl.core.platform_specific.IPConfig;
+import qouteall.imm_ptl.core.platform_specific.O_O;
+import qouteall.imm_ptl.core.portal.PortalRenderInfo;
+import qouteall.imm_ptl.core.portal.animation.ClientPortalAnimationManagement;
+import qouteall.imm_ptl.core.portal.animation.StableClientTimer;
+import qouteall.imm_ptl.core.render.CrossPortalEntityRenderer;
+import qouteall.imm_ptl.core.render.ForceMainThreadRebuild;
+import qouteall.imm_ptl.core.render.GuiPortalRendering;
+import qouteall.imm_ptl.core.render.ImmPtlViewArea;
+import qouteall.imm_ptl.core.render.MyRenderHelper;
+import qouteall.imm_ptl.core.render.SecondaryWorldRenderCore;
+import qouteall.imm_ptl.core.render.ShaderCodeTransformation;
+import qouteall.imm_ptl.core.render.VisibleSectionDiscovery;
+import qouteall.imm_ptl.core.render.context_management.CloudContext;
+import qouteall.imm_ptl.core.render.optimization.GLResourceCache;
+import qouteall.imm_ptl.core.render.optimization.SharedBlockMeshBuffers;
+import qouteall.imm_ptl.core.render.renderer.RendererUsingFrameBuffer;
+import qouteall.imm_ptl.core.render.renderer.RendererUsingStencil;
+import qouteall.imm_ptl.core.teleportation.ClientTeleportationManager;
+import qouteall.q_misc_util.dimension.DimensionIntId;
+import qouteall.q_misc_util.my_util.MyTaskList;
+
+public class IPModMainClient {
+    
+    private static void showNvidiaVideoCardWarning() {
+        IPGlobal.CLIENT_TASK_LIST.addTask(MyTaskList.withDelayCondition(
+            () -> Minecraft.getInstance().level == null,
+            MyTaskList.oneShotTask(() -> {
+                if (IPMcHelper.isNvidiaVideocard()) {
+                    // C2-1c ledger (cosmetic, no fix): under D11 feed-only, isSodiumPresent() is FALSE with sodium installed — this "install sodium" line then shows spuriously; dies with the feed-only state.
+                    if (!SodiumInterface.invoker.isSodiumPresent()) {
+                        CHelper.printChat(
+                            Component.translatable("imm_ptl.nvidia_warning")
+                                .withStyle(ChatFormatting.RED)
+                                .append(McHelper.getLinkText("https://github.com/CaffeineMC/sodium-fabric/issues/1486"))
+                        );
+                    }
+                }
+            })
+        ));
+    }
+    
+    private static void showQuiltWarning() {
+        IPGlobal.CLIENT_TASK_LIST.addTask(MyTaskList.withDelayCondition(
+            () -> Minecraft.getInstance().level == null,
+            MyTaskList.oneShotTask(() -> {
+                if (O_O.isQuilt()) {
+                    if (IPConfig.getConfig().shouldDisplayWarning("quilt")) {
+                        CHelper.printChat(
+                            Component.translatable("imm_ptl.quilt_warning")
+                                .append(IPMcHelper.getDisableWarningText("quilt"))
+                        );
+                    }
+                }
+            })
+        ));
+    }
+    
+    public static void init() {
+        // NF-PARITY L6 fix (2026-08-26): re-homed from GlobalPortalStorage.init's
+        // !isDedicatedServer() branch — the server init chain runs pre-Minecraft on NeoForge
+        // and the IPCGlobal touch froze PortalRenderer.client null (see the note there).
+        // Timing-neutral: CLIENT_CLEANUP_EVENT only fires on disconnect, long after init.
+        qouteall.imm_ptl.core.portal.global_portals.GlobalPortalStorageClient.initClient();
+
+        ClientWorldLoader.init();
+        
+        ClientTeleportationManager.init();
+        
+        Minecraft.getInstance().execute(() -> {
+            ShaderCodeTransformation.init();
+            
+            MyRenderHelper.init();
+            
+            IPCGlobal.rendererUsingStencil = new RendererUsingStencil();
+            IPCGlobal.rendererUsingFrameBuffer = new RendererUsingFrameBuffer();
+            
+            IPCGlobal.renderer = IPCGlobal.rendererUsingStencil;
+        });
+        
+        DubiousThings.init();
+        
+        CrossPortalEntityRenderer.init();
+        
+        GLResourceCache.init();
+        
+        CollisionHelperClient.initClient(); // NF-PARITY C3
+        
+        PortalRenderInfo.init();
+        
+        CloudContext.init();
+        
+        SharedBlockMeshBuffers.init();
+        
+        GcMonitor.initClient();
+        
+        ClientPlatform.get().onRegisterClientCommands(new ClientPlatform.ClientCommandRegistrationHandler() { // NF-PARITY W11
+            @Override
+            public <S> void register(CommandDispatcher<S> dispatcher, ClientPlatform.ClientCommandSupport<S> support) {
+                ClientDebugCommand.register(dispatcher, support);
+            }
+        });
+        
+//        showIntelVideoCardWarning();
+        
+        showNvidiaVideoCardWarning();
+        
+        showQuiltWarning();
+        
+        StableClientTimer.init();
+        
+        ClientPortalAnimationManagement.init();
+        
+        VisibleSectionDiscovery.init();
+
+        SecondaryWorldRenderCore.init();
+
+        ImmPtlViewArea.init();
+        
+        IPFlywheelCompat.init();
+    
+        GuiPortalRendering._init();
+        
+        ImmPtlNetworking.initClient();
+        ImmPtlNetworkConfig.initClient();
+        
+        ForceMainThreadRebuild.init();
+        
+        IPCGlobal.CLIENT_CLEANUP_EVENT.register(() -> {
+            IPGlobal.CLIENT_TASK_LIST.forceClearTasks();
+        });
+        
+        DimensionIntId.initClient();
+    }
+    
+}

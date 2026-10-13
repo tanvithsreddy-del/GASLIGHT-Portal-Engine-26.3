@@ -1,0 +1,43 @@
+{
+  "required": true,
+  "package": "qouteall.imm_ptl.core.compat.mixin",
+  "plugin": "qouteall.imm_ptl.core.compat.IPCompatMixinPlugin",
+  "compatibilityLevel": "JAVA_25",
+  "minVersion": "0.8",
+  "client": [
+    "sodium.IESodiumWorldRenderer",
+    "sodium.IESodiumCameraTimingControl",
+    "sodium.MixinSodiumRenderSectionManager",
+    "sodium.MixinSodiumRenderRegion",
+    "sodium.MixinSodiumRenderRegionManager_PortalBatchClear",
+    "sodium.MixinSodiumFlawlessFrames",
+    "sodium.MixinSodiumShaderManagerCompilationCache_ClipSourcePatch",
+    "sodium.MixinSodiumGLDrawContext_ClipUpload",
+    "sodium.MixinSodiumViewportExt",
+    "sodium.MixinSodiumViewport_CullConsumer",
+    "sodium.MixinSodiumWorldRenderer_CullSnapshot",
+    "sodium.MixinSodiumWorldRenderer_OuterReprepare",
+    "sodium.MixinSodiumOcclusionCuller_CaveCull",
+    "sodium.MixinSodiumProbe_ShaderSources",
+    "sodium.MixinSodiumProbe_GlCommandEncoder",
+    "sodium.MixinSodiumFullbrightProbe_GlCommandEncoder",
+    "sodium.MixinSodiumChunkRenderList_Probe",
+    "sodium.MixinSodiumDefaultChunkRenderer_PrepareProbe",
+    "iris.MixinIrisHandRenderer_SeamDepthBracket",
+    "iris.MixinIrisHandRenderer_SubmitTap",
+    "iris.MixinIrisHandDrawState_GlCommandEncoder",
+    "iris.MixinIrisSodiumTransformPatcher_ClipInject",
+    "iris.MixinIrisCompositeRenderer_BloomApertureMask",
+    "iris.MixinIrisCompositeRenderer_DestPrevWrite",
+    "iris.MixinIrisCompositeRenderer_DestPrevRestore",
+    "iris.MixinIrisComputeProgram_ActDispatch",
+    "iris.MixinIrisShadowCompositeRenderer_ActRenderAll",
+    "iris.MixinIrisCompositeRenderer_Census",
+    "iris.MixinIrisCompositeRenderer_CensusPostWrite",
+    "iris.MixinIrisProgram_Census",
+    "cloth.MixinClothTooltipListEntry_LabelHover"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

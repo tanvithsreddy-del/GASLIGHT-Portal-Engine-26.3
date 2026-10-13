@@ -1,0 +1,213 @@
+plugins {
+    id 'multiloader-loader'
+    id 'net.neoforged.moddev'
+}
+
+neoForge {
+    version = project.neo_version
+
+    def at = project(':common').file('src/main/resources/META-INF/accesstransformer.cfg')
+    if (at.exists()) {
+        accessTransformers.from(at.absolutePath)
+    }
+
+    // NF-PARITY D.1 (2026-08-25): moddev defaults this to FALSE, which makes a stale AT entry
+    // a silent no-op — the exact failure family the repo's scoped-suppression lessons ban.
+    // All 16 entries were verified against neoforge262-ref; this keeps them verified.
+    validateAccessTransformers = true
+
+    runs {
+        configureEach {
+            systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+            logLevel = org.slf4j.event.Level.DEBUG
+        }
+        client {
+            client()
+            gameDirectory = file('runs/client')
+            // NF-PARITY verification lever: -PquickPlayWorld=<saveName> boots straight into a
+            // singleplayer world (headless-ish smoke legs without UI interaction).
+            if (project.findProperty('quickPlayWorld')) {
+                programArguments.addAll('--quickPlaySingleplayer', project.findProperty('quickPlayWorld').toString())
+            }
+            // -PquickPlayServer=<host:port> — joins a server straight from boot (the L3
+            // handshake leg: config-phase ImmPtlConfigurationTask over a real connection).
+            if (project.findProperty('quickPlayServer')) {
+                programArguments.addAll('--quickPlayMultiplayer', project.findProperty('quickPlayServer').toString())
+            }
+            // NF-PARITY W18: the C2 JIT protection is a property of the ported render code,
+            // NOT of the loader — the EXCEPTION_ACCESS_VIOLATION reproduced on both Temurin
+            // 25.0.2 and Zulu 25.0.4 (migration/C2_JIT_PROTECTION.md; proven leg E2
+            // 2026-08-02). One dontinline on the leaf, same as fabric/build.gradle's default
+            // c2JitArgs branch. Single-quoted so nothing interpolates.
+            jvmArgument '-XX:CompileCommand=dontinline,qouteall.imm_ptl.core.render.ViewAreaRenderer::renderPortalArea'
+            // 26.3 MULTI-LOADER DEV AID (mirror of fabric/build.gradle's row) — window title tag "[NeoForge + Sodium]".
+            jvmArgument '-Dseamlessportals.windowTitleTag=true'
+            // STAGE CENSUS lever (2026-08-30, NF x-ray-flash round): mirror of the fabric rows.
+            //   .\gradlew.bat :neoforge:runClient -PstageCensus=true
+            if (project.findProperty('stageCensus') == 'true') {
+                jvmArgument '-Dseamlessportals.stageCensus=true'
+            }
+        }
+        server {
+            server()
+            programArgument '--nogui'
+            gameDirectory = file('runs/server')
+            jvmArgument '-XX:CompileCommand=dontinline,qouteall.imm_ptl.core.render.ViewAreaRenderer::renderPortalArea'
+        }
+        // NF-PARITY sodium/iris leg (2026-08-26): mirrors fabric's client-sodium run — a
+        // SEPARATE game dir whose mods/ holds the first-party -neoforge Sodium+Iris jars
+        // (runs/client-sodium/mods; FML scans the game dir's mods folder in dev). Same JIT
+        // protection + quickplay levers as the plain client run; the plain run stays
+        // sodium-free so the two states can't contaminate each other.
+        clientSodium {
+            client()
+            gameDirectory = file('runs/client-sodium')
+            jvmArgument '-XX:CompileCommand=dontinline,qouteall.imm_ptl.core.render.ViewAreaRenderer::renderPortalArea'
+            // 26.3 MULTI-LOADER DEV AID (mirror of fabric/build.gradle's row) — window title tag "[NeoForge + Sodium]".
+            jvmArgument '-Dseamlessportals.windowTitleTag=true'
+            // DEV-ONLY GlRenderPass.VALIDATION (gated on IS_RUNNING_IN_IDE — never runs in
+            // production) blindly indexes getVertexFormatBindings()[i<16], and an
+            // iris-wrapped translucent pipeline carries a compact (length-1) bindings array
+            // -> AIOOBE at GlCommandEncoder.validateDraw:506 on the first shaded frame.
+            // NeoForge ships this first-party escape hatch for exactly that
+            // (GlRenderPass.java:27). Functionally harmless: the GL bind path iterates the
+            // array's own length.
+            jvmArgument '-Dneoforge.disableGlValidation=true'
+            if (project.findProperty('quickPlayWorld')) {
+                programArguments.addAll('--quickPlaySingleplayer', project.findProperty('quickPlayWorld').toString())
+            }
+            if (project.findProperty('compatProbe') == 'true') {
+                jvmArgument '-Dseamlessportals.compatProbe=true'
+            }
+            if (project.findProperty('sodiumCompatLever') == 'true') {
+                jvmArgument '-Dseamlessportals.experimentalSodiumCompat=true'
+            }
+            if (project.findProperty('shaderpackViewsProbe') == 'true') {
+                jvmArgument '-Dseamlessportals.shaderpackViewsProbe=true'
+            }
+            // STAGE CENSUS lever (mirror of the client run's row).
+            if (project.findProperty('stageCensus') == 'true') {
+                jvmArgument '-Dseamlessportals.stageCensus=true'
+            }
+        }
+    }
+
+    mods {
+        "${project.mod_id}" {
+            sourceSet sourceSets.main
+        }
+    }
+}
+
+// NF-PARITY W18: the gradle.properties toolchain pin (jdkVendor=AZUL) does NOT carry to
+// moddev — ModDevRunWorkflow copies ONLY languageVersion into the launcher spec and drops
+// the vendor (recon-verified against ModDevRunWorkflow.java:417-418; the
+// multiloader-common.gradle comment about loom deriving the launcher is loom-only). Re-pin
+// the launcher explicitly on every run task. Per the repo's standing rule
+// (gradle.properties:53-58): measure the LIVE process command line rather than trusting
+// this — Get-CimInstance filtered to this project's path must show zulu-25.
+tasks.withType(JavaExec).configureEach {
+    if (name.toLowerCase().contains('run')) {
+        javaLauncher = javaToolchains.launcherFor {
+            languageVersion = JavaLanguageVersion.of(project.java_version as int)
+            if (project.hasProperty('jdkVendor') && project.jdkVendor) {
+                vendor = JvmVendorSpec.matching(project.jdkVendor as String)
+            }
+        }
+    }
+}
+
+repositories {
+    // S19-E lineage: real Sodium + Iris from the Modrinth maven (empty POMs, no transitives).
+    maven {
+        name = 'Modrinth'
+        url = 'https://api.modrinth.com/maven'
+        content {
+            includeGroup 'maven.modrinth'
+        }
+    }
+    // Real Cloth Config from the shedaniel maven (IP build.gradle:34 precedent).
+    maven {
+        name = 'Shedaniel'
+        url = 'https://maven.shedaniel.me/'
+        content {
+            includeGroupByRegex 'me\\.shedaniel.*'
+        }
+    }
+}
+
+dependencies {
+    // NF-PARITY W15 (2026-08-25): the FABRIC classifiers are RETIRED here — Sodium and Iris
+    // publish first-party -neoforge builds of the SAME versions on the SAME Modrinth
+    // projects (live-verified 2026-08-25: jars present; mod ids stay `sodium`/`iris`; all
+    // 23 compat-mixin target classes present under identical loader-neutral names —
+    // sodium's inside its META-INF/jarjar nested mod jar, iris's top-level). compileOnly
+    // ONLY: the compat code is invoker-gated at runtime (RenderCompatGating installs the
+    // OnSodiumPresent/OnIrisPresent invokers when the mods are detected); users supply the
+    // runtime jars.
+    // COMPILE classpath: the FABRIC classifiers — the -neoforge sodium maven artifact is a
+    // bootstrap wrapper whose classes live in a nested META-INF/jarjar mod jar, unusable as
+    // a compile dep. The class surface is IDENTICAL (live-verified 2026-08-25: all compat-
+    // mixin target FQNs present in the -neoforge builds — sodium nested, iris top-level), so
+    // compiling against -fabric and running against -neoforge is sound. compileOnly ONLY —
+    // these jars must NEVER enter the NeoForge runtime.
+    compileOnly "maven.modrinth:sodium:${project.sodium_version}"
+    compileOnly "maven.modrinth:iris:${project.iris_version}"
+
+    // NF-PARITY W15: real Cloth Config, NEOFORGE build — and IMPLEMENTATION + jarJar, not
+    // compileOnly: IPConfig implements ConfigData, which resolves at class-definition time →
+    // NCDFE without the runtime jar. This is the recorded C7 landmine
+    // (migration/EXECUTION_PLAN.md:1600-1601), now discharged. jarJar ships it inside the
+    // mod jar (mod id `cloth_config`, verified from the jar's neoforge.mods.toml); needed on
+    // BOTH dists (IPModMain.loadConfig runs on both). Zero declared transitives on the
+    // -neoforge artifact (module metadata verified) — no excludes needed.
+    implementation "me.shedaniel.cloth:cloth-config-neoforge:${project.cloth_config_version}"
+    jarJar "me.shedaniel.cloth:cloth-config-neoforge:${project.cloth_config_version}"
+}
+
+sourceSets.main.resources {
+    srcDir('src/generated/resources')
+}
+
+var generateModMetadata = tasks.register("generateModMetadata", ProcessResources) {
+    var replaceProperties = [
+        minecraft_version      : project.minecraft_version,
+        minecraft_version_range : project.minecraft_version_range,
+        neo_version             : project.neo_version,
+        neo_version_range       : project.neo_version_range,
+        loader_version_range    : project.loader_version_range,
+        mod_id                  : project.mod_id,
+        mod_name                : project.mod_name,
+        mod_license             : project.mod_license,
+        mod_version             : project.mod_version,
+        mod_description         : project.mod_description,
+    ]
+    inputs.properties replaceProperties
+    expand replaceProperties
+    from "src/main/templates"
+    into "build/generated/sources/modMetadata"
+}
+sourceSets.main.resources.srcDir generateModMetadata
+neoForge.ideSyncTask generateModMetadata
+
+// ===== 26.3: the clientSodium run's mods folder ==================================================================
+// FML scans <gameDir>/mods in dev, and the first-party -neoforge Sodium jar has to arrive there as a MOD (never on the
+// compile/runtime classpath — see the compileOnly note above). Until now it was placed by hand; this resolves the
+// pinned artifact (gradle.properties: sodium_neoforge_version) from the Modrinth maven and copies it in before
+// :neoforge:runClientSodium. A Copy, not a Sync: jars someone placed there by hand are never deleted.
+// Iris: there is NO -neoforge Iris build for 26.3 (Modrinth, 2026-09-20: fabric only), so the NeoForge shaders leg
+// cannot run on this version yet; when one is published, pin it in iris_neoforge_version and add it here.
+configurations {
+    clientSodiumMods {
+        canBeConsumed = false
+        transitive = false
+    }
+}
+dependencies {
+    clientSodiumMods "maven.modrinth:sodium:${project.sodium_neoforge_version}"
+}
+def prepareClientSodiumMods = tasks.register('prepareClientSodiumMods', Copy) {
+    from configurations.clientSodiumMods
+    into layout.projectDirectory.dir('runs/client-sodium/mods')
+}
+tasks.matching { it.name == 'runClientSodium' }.configureEach { dependsOn prepareClientSodiumMods }

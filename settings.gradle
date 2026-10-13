@@ -1,0 +1,30 @@
+pluginManagement {
+    repositories {
+        gradlePluginPortal()
+        mavenCentral()
+        exclusiveContent {
+            forRepository {
+                maven {
+                    name = 'Fabric'
+                    url = uri('https://maven.fabricmc.net')
+                }
+            }
+            filter {
+                includeGroupAndSubgroups('net.fabricmc')
+            }
+        }
+    }
+}
+
+plugins {
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '1.0.0'
+}
+
+rootProject.name = 'seamlessportals'
+include('common', 'neoforge', 'fabric')
+
+// 26.3: the MinecraftForge module (ForgeGradle 7) is OPT-IN while it is being brought up, so nothing it does can
+// affect the working Fabric / NeoForge builds:  .\gradlew.bat :forge:compileJava -Penable_forge=true
+if (providers.gradleProperty('enable_forge').getOrElse('false') == 'true') {
+    include('forge')
+}

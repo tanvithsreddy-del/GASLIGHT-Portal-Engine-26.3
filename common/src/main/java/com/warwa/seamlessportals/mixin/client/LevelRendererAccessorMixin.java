@@ -1,0 +1,235 @@
+package com.warwa.seamlessportals.mixin.client;
+
+import it.unimi.dsi.fastutil.objects.ObjectArrayList;
+import net.minecraft.client.renderer.LevelRenderer;
+import net.minecraft.client.renderer.RenderBuffers;
+import net.minecraft.client.renderer.ViewArea;
+import net.minecraft.client.renderer.chunk.SectionRenderDispatcher;
+import net.minecraft.client.renderer.state.level.LevelRenderState;
+import org.spongepowered.asm.mixin.Final;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Mutable;
+import org.spongepowered.asm.mixin.gen.Accessor;
+
+/**
+ * Accessor mixin for LevelRenderer private fields needed by portal rendering.
+ *
+ * Target fields (verified from LevelRenderer.java):
+ *   private @Nullable ViewArea viewArea                              — line ~306
+ *   private final ObjectArrayList<RenderSection> visibleSections     — line 147
+ *   private final LevelRenderState levelRenderState                  — line 169
+ */
+@Mixin(LevelRenderer.class)
+public interface LevelRendererAccessorMixin {
+
+    @Accessor("viewArea")
+    ViewArea seamlessportals$getViewArea();
+
+    @Accessor("visibleSections")
+    ObjectArrayList<SectionRenderDispatcher.RenderSection> seamlessportals$getVisibleSections();
+
+    /**
+     * Read the renderer's LevelRenderState.
+     * For secondary renderers with isolated state, this returns their OWN state
+     * (not the shared GameRenderState.levelRenderState).
+     */
+    @Accessor("levelRenderState")
+    LevelRenderState seamlessportals$getLevelRenderState();
+
+    /**
+     * Replace the renderer's LevelRenderState with an isolated instance.
+     * Called after constructing secondary renderers so extractLevel() doesn't
+     * corrupt the main renderer's state.
+     *
+     * Matches IP's architecture where each LevelRenderer has its own state.
+     * MC 26.1.2 shares via GameRenderState; this mixin restores isolation.
+     */
+    @Accessor("levelRenderState")
+    @Mutable
+    void seamlessportals$setLevelRenderState(LevelRenderState state);
+
+    // 26.2: the {@code lastCameraSectionX/Y/Z} int fields were REMOVED from
+    // LevelRenderer. The "did the camera section change since last frame?" gate
+    // that {@code cullTerrain} used to consult them for is now encapsulated
+    // inside {@link ViewArea#repositionCamera(net.minecraft.core.SectionPos)},
+    // which returns {@code boolean} (true iff the grid actually re-centered) and
+    // tracks the center internally via its {@code RotatingSectionStorage}
+    // ({@link ViewArea#getCameraSectionPos()} reads it). The old
+    // seamlessportals$setLastCameraSection{X,Y,Z} accessors were therefore
+    // removed; callers now seed the grid center directly through the public
+    // {@code viewArea.repositionCamera(SectionPos.of(...))} (see
+    // {@code SeamlessClientTeleport} / {@code HandleRespawnMixin}).
+
+    /**
+     * Read this renderer's {@link RenderBuffers}. For PortalWorldManager-built
+     * secondaries this is their own private instance; for the vanilla
+     * {@code mc.levelRenderer} this is the same instance as
+     * {@code mc.renderBuffers}. Both get swapped to a pooled buffer during
+     * portal sub-render via {@link com.warwa.seamlessportals.render.PortalContextSwitch#withSwitchedWorld}.
+     */
+    @Accessor("renderBuffers")
+    RenderBuffers seamlessportals$getRenderBuffers();
+
+    @Accessor("renderBuffers")
+    @Mutable
+    void seamlessportals$setRenderBuffers(RenderBuffers renderBuffers);
+
+    /**
+     * The {@link net.minecraft.client.renderer.feature.FeatureRenderDispatcher}
+     * tied to this renderer. Secondary renderers created by
+     * {@link com.warwa.seamlessportals.client.PortalWorldManager#createRenderer}
+     * own their own dispatcher; exposing this lets
+     * {@link com.warwa.seamlessportals.render.PortalContextSwitch#withSwitchedWorld}
+     * reach into the dispatcher to swap its buffer-source references in
+     * sync with the renderBuffers swap, so entity-equipment item draws go
+     * to the actively-flushed buffer rather than the dormant
+     * {@code destRenderBuffers.bufferSource()}.
+     */
+    @Accessor("featureRenderDispatcher")
+    net.minecraft.client.renderer.feature.FeatureRenderDispatcher seamlessportals$getFeatureRenderDispatcher();
+
+    /**
+     * 26.2: the {@code featureRenderDispatcher} field is now {@code final} and
+     * is derived from the passed {@code GameRenderer} inside the LevelRenderer
+     * constructor. Secondary portal-view renderers need their OWN isolated
+     * dispatcher (the old explicit-arg ctor gave us that directly); we override
+     * the field after construction to restore that isolation.
+     */
+    @Accessor("featureRenderDispatcher")
+    @Mutable
+    void seamlessportals$setFeatureRenderDispatcher(
+        net.minecraft.client.renderer.feature.FeatureRenderDispatcher dispatcher);
+
+    /**
+     * The block-atlas {@link com.mojang.blaze3d.textures.GpuSampler} that
+     * {@code LevelRenderer.addMainPass} hands to
+     * {@code ChunkSectionsToRender.renderGroup(...)} (LevelRenderer.java:127/402/409).
+     *
+     * <p>Phase 5 (stencil-direct): the dest-world terrain is drawn into the main
+     * target via a direct {@code renderGroup(OPAQUE, sampler)} call instead of a
+     * nested {@code render(...)} framegraph. {@code renderGroup} needs this sampler.
+     * The dest renderer's own sampler is {@code null} (its main pass never runs), so
+     * we read the MAIN renderer's — it is a plain CLAMP_TO_EDGE/LINEAR atlas sampler,
+     * not renderer-specific, and is live by {@code AFTER_TRANSLUCENT_TERRAIN} (the
+     * main pass created it at LevelRenderer.java:402 before drawing opaque terrain).
+     */
+    @Accessor("chunkLayerSampler")
+    com.mojang.renderpearl.api.textures.GpuSampler seamlessportals$getChunkLayerSampler();
+
+    /**
+     * The renderer's {@link net.minecraft.client.resources.model.sprite.AtlasManager} — needed
+     * to construct a {@code SkyRenderer} for the portal-view dest sky (Phase 5 Step 2b). The dest
+     * renderer's own {@code skyRenderer} is null (its {@code addSkyPass} never runs), so we build
+     * one from this + the texture manager + the main target and drive it with the dest sky state.
+     */
+    @Accessor("atlasManager")
+    net.minecraft.client.resources.model.sprite.AtlasManager seamlessportals$getAtlasManager();
+
+    /**
+     * The renderer's {@link net.minecraft.client.renderer.SubmitNodeStorage} — the submit buffer
+     * that {@code submitFeatures} fills and {@code featureRenderDispatcher.prepareFrame} consumes.
+     * Phase 5 Step 2c: needed to render the dest dimension's entities/block-entities/particles in
+     * the portal view (the FBO path did this inside {@code render()}; the direct path must drive
+     * submit→prepare→execute itself).
+     */
+    @Accessor("submitNodeStorage")
+    net.minecraft.client.renderer.SubmitNodeStorage seamlessportals$getSubmitNodeStorage();
+
+    /**
+     * Invoke the renderer's private {@code submitFeatures(...)} — gathers the entity / block-entity
+     * / particle render states (already extracted into {@code levelRenderState}) into the submit
+     * storage so {@code FeatureRenderDispatcher.renderAllFeatures} can draw them.
+     * {@code renderOutline} gates the TARGETED-BLOCK outline ({@code submitBlockOutline} — not
+     * entity glow, which {@code shouldShowEntityOutlines} governs). ALWAYS {@code false} from mod
+     * call sites: vanilla's submitBlockOutline carries Fabric API's injected BEFORE_BLOCK_OUTLINE
+     * handler, which NPEs outside the real framegraph (its per-frame context is unprepared on the
+     * decomposed portal passes — the S18 (d)-round log-audit finding). The dest-pass outline is
+     * instead submitted mod-side ({@code SecondaryWorldRenderCore.submitDestBlockOutline}, a
+     * byte-faithful vanilla copy through the public collector API).
+     */
+    @org.spongepowered.asm.mixin.gen.Invoker("submitFeatures")
+    void seamlessportals$invokeSubmitFeatures(
+        LevelRenderState levelRenderState,
+        net.minecraft.client.renderer.SubmitNodeCollector submitNodeCollector,
+        boolean renderOutline);
+
+    /**
+     * Invoke the renderer's private {@code compileSections(CameraRenderState)}
+     * (LevelRenderer.java:608) — the ONLY vanilla consumer of the
+     * {@code levelRenderState.sectionUpdateRenderStates} queue that
+     * {@code LevelExtractor.extract}'s sectionUpdates loop fills (each entry's
+     * dirty flag is consumed by {@code setNotDirty} at queue time,
+     * LevelExtractor.java:167). Vanilla pairs them inside {@code render()}
+     * (:254-255); the stencil-direct portal path never calls {@code render()}
+     * for the dest renderer, so it must invoke this directly after each
+     * {@code extract(...)} or the queued compiles are discarded by the next
+     * extract's {@code levelRenderState.reset()} — stranding sections
+     * dirty=false + UNCOMPILED forever (the post-crossing chunk-hole bug).
+     * Invoking the real method keeps the 1:1 vanilla semantics (fade windows,
+     * sync-nearby compile options, translucent resort) and the
+     * {@link LevelRendererCompileSectionsMixin} out-of-range filter applies
+     * to it automatically.
+     */
+    @org.spongepowered.asm.mixin.gen.Invoker("compileSections")
+    void seamlessportals$invokeCompileSections(
+        net.minecraft.client.renderer.state.level.CameraRenderState camera);
+
+    /** S15 (recursive-view entities): the ENTITIES-ONLY submit — vanilla's private
+     *  {@code submitEntities(PoseStack, LevelRenderState, SubmitNodeCollector)}
+     *  (LevelRenderer.java:653) reads only {@code lrs.cameraRenderState} +
+     *  {@code lrs.entityRenderStates}. Invoking the REAL method (not a re-expression)
+     *  keeps every registered mixin anchor on it firing exactly as on the cross-dim
+     *  path — the MixinLevelRenderer_CrossPortalEntity HEAD/TAIL/per-entity hooks
+     *  (FrontClipping inner-clip bracket, R3 collided-entity tagging) need no new
+     *  wiring. Used with a scratch LRS by
+     *  {@code SecondaryWorldRenderCore.renderPortalEntitiesSameDim} (full
+     *  {@code submitFeatures} would re-submit main particles under the wrong camera,
+     *  re-submit gizmos, and clear shared lists — entities-only is the surgical cut). */
+    @org.spongepowered.asm.mixin.gen.Invoker("submitEntities")
+    void seamlessportals$invokeSubmitEntities(
+        com.mojang.blaze3d.vertex.PoseStack poseStack,
+        LevelRenderState levelRenderState,
+        net.minecraft.client.renderer.SubmitNodeCollector output);
+
+    /** S18.4 (same-dim block entities): vanilla's private
+     *  {@code submitBlockEntities(PoseStack, LevelRenderState, SubmitNodeCollector)}
+     *  (LevelRenderer.java:664-677) — reads {@code lrs.cameraRenderState.pos} for the
+     *  camera-relative translate and iterates {@code lrs.blockEntityRenderStates}; the exact
+     *  structural parallel of {@code submitEntities} above. Used with the same scratch LRS +
+     *  isolated storage by {@code renderPortalEntitiesSameDim} so loop-back passes draw their
+     *  block entities in the same single {@code renderAllFeatures} as their entities
+     *  (mirroring cross-dim's submitFeatures order: entities then BEs into one storage). */
+    @org.spongepowered.asm.mixin.gen.Invoker("submitBlockEntities")
+    void seamlessportals$invokeSubmitBlockEntities(
+        com.mojang.blaze3d.vertex.PoseStack poseStack,
+        LevelRenderState levelRenderState,
+        net.minecraft.client.renderer.SubmitNodeCollector output);
+
+    /**
+     * The renderer's {@link net.minecraft.client.renderer.LevelTargetBundle} — the per-frame
+     * framegraph stage-target handles ({@code translucent/itemEntity/particles/weather/clouds}).
+     * javap-verified 26.2: {@code private final LevelTargetBundle targets} with PUBLIC mutable
+     * {@code ResourceHandle} fields. SAME-DIM WATER/CLOUDS fix (2026-08-29): the dest-pass
+     * stage-target bracket in {@code SecondaryWorldRenderCore.renderDestWorld} saves + nulls the
+     * stage handles for the pass duration so every dest draw's target probe
+     * ({@code ChunkSectionLayerGroup.outputTarget()}, {@code CloudRenderer.render}'s internal
+     * {@code cloudsTarget()}) falls back to the MAIN target — the environment cross-dim passes
+     * (secondary renderers, all handles null) always had. Read-only accessor: the FIELD is never
+     * reassigned; the bundle's public handle fields are what the bracket swaps.
+     */
+    @Accessor("targets")
+    net.minecraft.client.renderer.LevelTargetBundle seamlessportals$getTargets();
+
+    /**
+     * 26.3: the device/ctor half of vanilla's per-frame chunk-prep FLAVOUR choice — javap 26.3 (Fabric merged,
+     * NeoForge-patched and Forge jars alike): {@code private final boolean multiDrawIndirectAvailable}, set once in the
+     * ctor from the device limits/features/workarounds (mc263-ref LevelRenderer.java:180-182) and ANDed each frame with
+     * {@code levelRenderState.shouldUseMultiDrawIndirectForTerrain} to pick {@code prepareChunkRendersIndirect} vs
+     * {@code prepareChunkRenders} (:266-272). Read off the renderer itself rather than re-derived from the device:
+     * Sodium 0.9.2 forces this very field FALSE in every LevelRenderer ctor (javap core.render.world.LevelRendererMixin
+     * — {@code @Shadow multiDrawIndirectAvailable} + {@code <init>} putfield) to keep vanilla on the branch it
+     * overwrites. Consumer: {@link com.warwa.seamlessportals.render.DestChunkPrep}.
+     */
+    @Accessor("multiDrawIndirectAvailable")
+    boolean seamlessportals$isMultiDrawIndirectAvailable();
+}

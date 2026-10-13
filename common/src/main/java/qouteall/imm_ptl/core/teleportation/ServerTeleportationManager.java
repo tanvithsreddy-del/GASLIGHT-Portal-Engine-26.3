@@ -1,0 +1,1099 @@
+package qouteall.imm_ptl.core.teleportation;
+
+import com.mojang.logging.LogUtils;
+import com.warwa.seamlessportals.platform.Platform;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.util.profiling.Profiler;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntitySpawnReason;
+import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.entity.projectile.Projectile;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.pathfinder.Path;
+import net.minecraft.world.phys.Vec3;
+import org.apache.commons.lang3.Validate;
+import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import qouteall.dimlib.api.DimensionAPI;
+import qouteall.imm_ptl.core.IPMcHelper;
+import qouteall.imm_ptl.core.IPPerServerInfo;
+import qouteall.imm_ptl.core.McHelper;
+import qouteall.imm_ptl.core.ScaleUtils;
+import qouteall.imm_ptl.core.chunk_loading.ImmPtlChunkTracking;
+import qouteall.imm_ptl.core.collision.PortalCollisionHandler;
+import qouteall.imm_ptl.core.compat.GravityChangerInterface;
+import qouteall.imm_ptl.core.ducks.IEEntity;
+import qouteall.imm_ptl.core.ducks.IEServerPlayNetworkHandler;
+import qouteall.imm_ptl.core.ducks.IEServerPlayerEntity;
+import qouteall.imm_ptl.core.mc_utils.ServerTaskList;
+import qouteall.imm_ptl.core.platform_specific.IPConfig;
+import qouteall.imm_ptl.core.platform_specific.O_O;
+import qouteall.imm_ptl.core.portal.Portal;
+import qouteall.imm_ptl.core.portal.global_portals.GlobalPortalStorage;
+import qouteall.q_misc_util.MiscHelper;
+import qouteall.q_misc_util.api.McRemoteProcedureCall;
+import qouteall.q_misc_util.my_util.MyTaskList;
+import qouteall.q_misc_util.my_util.WithDim;
+
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.UUID;
+import java.util.WeakHashMap;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class ServerTeleportationManager {
+    private static final Logger LOGGER = LogUtils.getLogger();
+    
+    private final Set<Entity> teleportingEntities = new HashSet<>();
+    private final WeakHashMap<Entity, Long> lastTeleportGameTime = new WeakHashMap<>();
+    public boolean isFiringMyChangeDimensionEvent = false;
+    public final WeakHashMap<ServerPlayer, WithDim<Vec3>> lastPosition = new WeakHashMap<>();
+    
+    public static ServerTeleportationManager of(MinecraftServer server) {
+        return IPPerServerInfo.of(server).teleportationManager;
+    }
+    
+    public static void init() {
+        Platform.get().onServerTickEnd(server -> { // NF-PARITY W9
+            of(server).tick(server);
+        });
+        
+        Portal.SERVER_PORTAL_TICK_SIGNAL.register(
+            (portal) -> {
+                ServerTeleportationManager serverTeleportationManager = of(portal.level().getServer());
+                getEntitiesToTeleport(portal).forEach(entity -> {
+                    serverTeleportationManager.startTeleportingRegularEntity(portal, entity);
+                });
+            }
+        );
+        
+        DimensionAPI.SERVER_PRE_REMOVE_DIMENSION_EVENT.register(
+            world -> of(world.getServer()).evacuatePlayersFromDimension(world)
+        );
+    }
+    
+    public ServerTeleportationManager() {
+    
+    }
+    
+    private void tick(MinecraftServer server) {
+        teleportingEntities.clear();
+        
+        manageGlobalPortalTeleportation();
+    }
+    
+    public static boolean shouldEntityTeleport(Portal portal, Entity entity) {
+        if (entity.level() != portal.level()) {return false;}
+        if (!portal.canTeleportEntity(entity)) {return false;}
+        // S14.47 — the attached-ELYTRA-BOOST-firework skip, THIRD half (log-proven: this IP path
+        // attempted these teleports — "Entity is too far to teleport FireworkRocketEntity" — and
+        // the in-range attempts recreated the rocket detached in the dest = the visible phantom
+        // "shooting out in front" of the emerging player; attachment is not persisted through the
+        // recreate). Same guard as ProjectilePortalHandler + EntityMixin (both block-era paths);
+        // the rocket is glued to the gliding player so its segment always crosses when the
+        // player's does. The player-crossing sweep in changePlayerDimension discards the orphan.
+        if (entity instanceof net.minecraft.world.entity.projectile.FireworkRocketEntity firework
+            && ((com.warwa.seamlessportals.mixin.FireworkRocketEntityAccessor) firework)
+                .seamlessportals$isAttachedToEntity()) {
+            return false;
+        }
+        Vec3 lastEyePos = entity.getEyePosition(0);
+        Vec3 nextEyePos = entity.getEyePosition(1);
+        
+        if (entity instanceof Projectile) {
+            nextEyePos = nextEyePos.add(McHelper.getWorldVelocity(entity));
+        }
+        
+        boolean movedThroughPortal = portal.isMovedThroughPortal(lastEyePos, nextEyePos);
+        return movedThroughPortal;
+    }
+    
+    public void startTeleportingRegularEntity(Portal portal, Entity entity) {
+        if (entity instanceof ServerPlayer) {
+            return;
+        }
+        if (entity instanceof Portal) {
+            return;
+        }
+        if (entity.getVehicle() != null || doesEntityClusterContainPlayer(entity)) {
+            cartProbe(entity, "TELEPORT-SKIP vehicle-or-player-cluster");
+            return;
+        }
+        if (entity.isRemoved()) {
+            cartProbe(entity, "TELEPORT-SKIP removed");
+            return;
+        }
+        if (!entity.canTeleport(entity.level(), portal.getDestinationWorld())) {
+            cartProbe(entity, "TELEPORT-SKIP canTeleport=false");
+            return;
+        }
+        if (isJustTeleported(entity, 1)) {
+            cartProbe(entity, "TELEPORT-SKIP just-teleported");
+            return;
+        }
+        //a new born entity may have last tick pos 0 0 0
+        if (entity.xo == 0 && entity.yo == 0 && entity.zo == 0) {
+            LOGGER.warn("Trying to teleport a fresh new entity {}", entity);
+            return;
+        }
+
+        double motion = McHelper.lastTickPosOf(entity).distanceToSqr(entity.position());
+        if (motion > 20) {
+            cartProbe(entity, "TELEPORT-SKIP motion>20");
+            return;
+        }
+        cartProbe(entity, "TELEPORT-QUEUED (detected in Portal.tick; runs at END_SERVER_TICK)");
+        ServerTaskList.of(portal.level().getServer()).addTask(() -> {
+            try {
+                teleportRegularEntity(entity, portal);
+            }
+            catch (Throwable e) {
+                LOGGER.error("", e);
+            }
+            return true;
+        });
+    }
+
+    /**
+     * RS (d) minecart-crossing instrument — one line per teleport-path event for watched carts
+     * ({@code -Dseamlessportals.seamCartProbe=true}, DEFAULT-OFF; byte-inert otherwise). Exists
+     * so a cart that never crosses names the gate that stopped it instead of failing silently.
+     */
+    private static void cartProbe(Entity entity, String msg) {
+        if (com.warwa.seamlessportals.passthrough.AperturePassthroughLever.SEAM_CART_PROBE
+            && entity instanceof net.minecraft.world.entity.vehicle.minecart.AbstractMinecart) {
+            com.warwa.seamlessportals.passthrough.SeamCartProbe.event(entity, msg);
+        }
+    }
+
+    /**
+     * RS (d): dump every term of the ridden-carry placement, because the arrival height is
+     * {@code player.position() + attachment} and nothing else — so when a ridden cart lands off
+     * the rail, exactly one of those two terms is wrong and this line says which. Probe-gated.
+     */
+    private static void cartCarryProbe(ServerPlayer player, Entity vehicle, String where) {
+        if (!com.warwa.seamlessportals.passthrough.AperturePassthroughLever.SEAM_CART_PROBE
+            || !(vehicle instanceof net.minecraft.world.entity.vehicle.minecart.AbstractMinecart)) {
+            return;
+        }
+        Vec3 attach = McHelper.getVehicleOffsetFromPassenger(vehicle, player);
+        LOGGER.info(
+            "[RS-CART] CARRY-TERMS {} playerPos={} playerEye={} eyeHeight={} pose={} riding={}"
+                + " attachment={} => vehiclePos would be {}",
+            where, player.position(), player.getEyePosition(), player.getEyeHeight(),
+            player.getPose(), player.getVehicle() != null, attach,
+            player.position().add(attach)
+        );
+    }
+    
+    private static Stream<Entity> getEntitiesToTeleport(Portal portal) {
+        return portal.level().getEntitiesOfClass(
+            Entity.class,
+            portal.getBoundingBox().inflate(2),
+            e -> true
+        ).stream().filter(
+            e -> !(e instanceof Portal)
+        ).filter(
+            entity -> shouldEntityTeleport(portal, entity)
+        );
+    }
+    
+    public void onPlayerTeleportedInClient(
+        ServerPlayer player,
+        ResourceKey<Level> dimensionBefore,
+        Vec3 eyePosBeforeTeleportation,
+        UUID portalId
+    ) {
+        if (player.getRemovalReason() != null) {
+            LOGGER.error("Trying to teleport a removed player {}", player);
+            return;
+        }
+        
+        Portal portal = findPortal(player.level().getServer(), dimensionBefore, portalId);
+        
+        if (portal == null) {
+            LOGGER.error(
+                "Unable to find portal {} in {} to teleport {}",
+                portalId, dimensionBefore.identifier(), player
+            );
+            return;
+        }
+        
+        lastTeleportGameTime.put(player, McHelper.getServerGameTime());
+        
+        Vec3 oldFeetPos = eyePosBeforeTeleportation.subtract(McHelper.getEyeOffset(player));
+        
+        String failReason = validatePlayerTeleportationAndGetReason(
+            player, dimensionBefore, oldFeetPos, portal
+        );
+        if (failReason == null) {
+            if (isTeleporting(player)) {
+                LOGGER.info("{} is teleporting frequently", player);
+            }
+            
+            notifyChasersForPlayer(player, portal);
+            
+            ResourceKey<Level> dimensionTo = portal.getDestDim();
+            Vec3 newEyePos = portal.transformPoint(eyePosBeforeTeleportation);
+            
+            recordLastPosition(player, dimensionBefore, oldFeetPos);
+            
+            teleportPlayer(player, dimensionTo, newEyePos);
+            
+            portal.onEntityTeleportedOnServer(player);
+            
+            ScaleUtils.onServerEntityTeleported(player, portal);
+            
+            if (portal.getTeleportChangesGravity()) {
+                Direction oldGravityDir = GravityChangerInterface.invoker.getGravityDirection(player);
+                GravityChangerInterface.invoker.setBaseGravityDirectionServer(
+                    player, portal.getTransformedGravityDirection(oldGravityDir)
+                );
+            }
+            
+        }
+        else {
+            LOGGER.error(
+                "Player {} {} {} cannot teleport through portal {}\nReason: {}",
+                player, player.level().dimension().identifier(), player.position(),
+                portal, failReason
+            );
+            teleportEntityGeneral(player, player.position(), ((ServerLevel) player.level()));
+            ScaleUtils.setBaseScale(player, ScaleUtils.getBaseScale(player));
+            GravityChangerInterface.invoker.setBaseGravityDirectionServer(
+                player, GravityChangerInterface.invoker.getGravityDirection(player)
+            );
+        }
+    }
+    
+    private @Nullable Portal findPortal(
+        MinecraftServer server,
+        ResourceKey<Level> dimensionBefore, UUID portalId
+    ) {
+        ServerLevel originalWorld = server.getLevel(dimensionBefore);
+        
+        if (originalWorld == null) {
+            LOGGER.error("Missing world {} when finding portal", dimensionBefore.identifier());
+            return null;
+        }
+        
+        Entity portalEntity = originalWorld.getEntity(portalId);
+        if (portalEntity == null) {
+            portalEntity = GlobalPortalStorage.get(originalWorld).data
+                .stream().filter(
+                    p -> p.getUUID().equals(portalId)
+                ).findFirst().orElse(null);
+        }
+        if (portalEntity == null) {
+            return null;
+        }
+        if (portalEntity instanceof Portal) {
+            return ((Portal) portalEntity);
+        }
+        return null;
+    }
+    
+    public void recordLastPosition(ServerPlayer player, ResourceKey<Level> dim, Vec3 pos) {
+        lastPosition.put(
+            player, new WithDim<>(dim, pos)
+        );
+    }
+    
+    /**
+     * @return null if valid. if invalid, it's the reason
+     */
+    private @Nullable String validatePlayerTeleportationAndGetReason(
+        ServerPlayer player,
+        ResourceKey<Level> dimensionBefore,
+        Vec3 posBefore,
+        Portal portal
+    ) {
+        if (player.getVehicle() != null) {
+            return null;
+        }
+        
+        // cannot teleport if having awaiting teleport
+        if (((IEServerPlayNetworkHandler) player.connection).ip_hasAwaitingTeleport()) {
+            return "has awaiting teleport";
+        }
+        
+        if (!portal.canTeleportEntity(player)) {
+            return "portal cannot teleport player";
+        }
+        
+        if (player.level().dimension() != dimensionBefore) {
+            return "player is not in the dimensionBefore in packet";
+        }
+        
+        if (player.position().distanceToSqr(posBefore) > 16 * 16) {
+            return "player is too far from the posBefore in packet";
+        }
+        
+        if (portal.getDistanceToNearestPointInPortal(posBefore) > 20) {
+            return "posBefore is too far from portal";
+        }
+        
+        return null;
+    }
+    
+    public static boolean canPlayerReachPos(
+        ServerPlayer player,
+        ResourceKey<Level> dimension,
+        Vec3 pos
+    ) {
+        Vec3 playerPos = player.position();
+        if (player.level().dimension() == dimension) {
+            if (playerPos.distanceToSqr(pos) < 256) {
+                return true;
+            }
+        }
+        return IPMcHelper.getNearbyPortals(player, 20)
+            .filter(portal -> portal.getDestDim() == dimension)
+            .filter(portal -> portal.canTeleportEntity(player))
+            .map(portal -> portal.transformPoint(playerPos))
+            .anyMatch(mappedPos -> mappedPos.distanceToSqr(pos) < 256);
+    }
+    
+    public static boolean canPlayerReachBlockEntity(
+        ServerPlayer player, BlockEntity blockEntity
+    ) {
+        Level world = blockEntity.getLevel();
+        if (world == null) {
+            return false;
+        }
+        return canPlayerReachPos(
+            player, world.dimension(),
+            Vec3.atCenterOf(blockEntity.getBlockPos())
+        );
+    }
+    
+    public void teleportPlayer(
+        ServerPlayer player,
+        ResourceKey<Level> dimensionTo,
+        Vec3 newEyePos
+    ) {
+        MinecraftServer server = player.level().getServer();
+        Profiler.get().push("portal_teleport");
+        
+        ServerLevel fromWorld = (ServerLevel) player.level();
+        ServerLevel toWorld = server.getLevel(dimensionTo);
+        
+        if (player.getVehicle() != null) {
+            cartCarryProbe(player, player.getVehicle(), "before-player-move ("
+                + (player.level().dimension() == dimensionTo ? "same-dim" : "cross-dim") + ")");
+        }
+
+        if (player.level().dimension() == dimensionTo) {
+            McHelper.setEyePos(player, newEyePos, newEyePos);
+            McHelper.updateBoundingBox(player);
+        }
+        else {
+            changePlayerDimension(player, fromWorld, toWorld, newEyePos);
+        }
+
+        if (player.getVehicle() != null) {
+            cartCarryProbe(player, player.getVehicle(), "after-player-move/before-adjustVehicle");
+        }
+        
+        McHelper.adjustVehicle(player);
+
+        // RS (d) instrument: the SAME-DIMENSION ridden crossing has no changePlayerDimension
+        // branch at all — the cart is carried purely by adjustVehicle above, which places it at
+        // player.position() + the passenger's ATTACHMENT vector (see the corrected note in
+        // changePlayerDimension: the cart's own position is discarded, so the arrival height is
+        // the player's arrival height plus the attachment, and nothing else).
+        if (player.getVehicle() != null) {
+            cartProbe(player.getVehicle(), "VEHICLE-CARRIED (player teleport, "
+                + (fromWorld == toWorld ? "same-dim via adjustVehicle" : "cross-dim") + ")");
+            cartCarryProbe(player, player.getVehicle(),
+                fromWorld == toWorld ? "same-dim/after-adjustVehicle" : "cross-dim/after-adjustVehicle");
+            // Always-on (not probe-gated): the placement itself, for gates to judge. Physics
+            // snaps an off-rail arrival back within a tick, so this is the only race-free record.
+            com.warwa.seamlessportals.passthrough.SeamCartContinuity.recordVehicleCarry(
+                player.getVehicle().getId(), player.getVehicle().position());
+        }
+
+        // reset the "authentic" player position as the current position
+        player.connection.resetPosition();
+
+        PortalCollisionHandler.updateCollidingPortalAfterTeleportation(
+            player, newEyePos, newEyePos, 1
+        );
+
+        if (player.getVehicle() != null) {
+            // F5: the carried vehicle needs the same immediate refresh the player just got —
+            // its straddling arrival relies on cross-portal collision (the not-yet-crossed
+            // half rides the far side's rail), and the END_SERVER_TICK sweep is a tick late.
+            Entity vehicle = player.getVehicle();
+            PortalCollisionHandler.updateCollidingPortalAfterTeleportation(
+                vehicle, McHelper.getEyePos(vehicle), McHelper.getEyePos(vehicle), 1
+            );
+        }
+
+        Profiler.get().pop();
+    }
+    
+    public void forceTeleportPlayer(
+        ServerPlayer player, ResourceKey<Level> dimensionTo, Vec3 newPos
+    ) {
+        forceTeleportPlayer(
+            player, dimensionTo, newPos, true
+        );
+    }
+    
+    public void forceTeleportPlayer(
+        ServerPlayer player, ResourceKey<Level> dimensionTo, Vec3 newPos,
+        boolean sendPacket
+    ) {
+        if (IPConfig.getConfig().serverTeleportLogging) {
+            LOGGER.info(
+                "Force teleporting {} to {} {}",
+                player, dimensionTo.identifier(), newPos
+            );
+        }
+        
+        ServerLevel fromWorld = (ServerLevel) player.level();
+        ServerLevel toWorld = player.level().getServer().getLevel(dimensionTo);
+        
+        if (toWorld == null) {
+            LOGGER.error(
+                "Cannot teleport player {} to non-existing dimension {}",
+                player, dimensionTo.identifier()
+            );
+            return;
+        }
+        
+        if (player.level().dimension() == dimensionTo) {
+            player.setPos(newPos.x, newPos.y, newPos.z);
+        }
+        else {
+            changePlayerDimension(player, fromWorld, toWorld, newPos.add(McHelper.getEyeOffset(player)));
+        }
+        
+        if (sendPacket) {
+            player.connection.teleport(
+                newPos.x,
+                newPos.y,
+                newPos.z,
+                player.getYRot(),
+                player.getXRot()
+            );
+        }
+        
+        // reset the "authentic" player position as the current position
+        player.connection.resetPosition();
+        
+        Vec3 newEyePos = McHelper.getEyePos(player);
+        PortalCollisionHandler.updateCollidingPortalAfterTeleportation(
+            player, newEyePos, newEyePos, 1
+        );
+        
+        ImmPtlChunkTracking.immediatelyUpdateForPlayer(player);
+    }
+    
+    /**
+     * {@link ServerPlayer#changeDimension}
+     */
+    private void changePlayerDimension(
+        ServerPlayer player,
+        ServerLevel fromWorld,
+        ServerLevel toWorld,
+        Vec3 newEyePos
+    ) {
+        // avoid the player from untracking all entities when removing from the old world
+        // see MixinChunkMap_E
+        teleportingEntities.add(player);
+        
+        Entity vehicle = player.getVehicle();
+        if (vehicle != null) {
+            ((IEServerPlayerEntity) player).ip_stopRidingWithoutTeleportRequest();
+        }
+        
+        Vec3 oldPos = player.position();
+
+        // S14.47 — discard the player's attached boost firework(s) in the SOURCE world before the
+        // move. Under PLAYER REUSE the rocket's attachedToEntity reference stays LIVE across the
+        // dimension swap (vanilla's recreate breaks it), so the orphan (1) keeps injecting elytra
+        // boost acceleration into the now-cross-dim player every tick (FireworkRocketEntity.tick
+        // setDeltaMovement — a real gameplay bug), (2) glues itself to the player's DEST-world
+        // coordinates inside the source world (60+ block per-tick moves = the "[ImmPtl] Skipping
+        // collision calculation because entity moves too fast" stack spam), and (3) gets
+        // colliding-portal-tracked into more teleport attempts. Vanilla's outcome is "the boost
+        // rocket is lost through a portal" (its orphan freezes at a removed player and burns out
+        // invisibly) — discard re-expresses that outcome under reuse. The rocket is invisible
+        // while attached (shouldRender && !isAttachedToEntity), so the discard has zero visual.
+        for (net.minecraft.world.entity.projectile.FireworkRocketEntity rocket :
+            fromWorld.getEntitiesOfClass(
+                net.minecraft.world.entity.projectile.FireworkRocketEntity.class,
+                player.getBoundingBox().inflate(8),
+                r -> ((com.warwa.seamlessportals.mixin.FireworkRocketEntityAccessor) r)
+                    .seamlessportals$getAttachedToEntity() == player
+            )
+        ) {
+            rocket.discard();
+        }
+
+        fromWorld.removePlayerImmediately(player, Entity.RemovalReason.CHANGED_DIMENSION);
+        ((IEEntity) player).ip_unsetRemoved();
+        
+        McHelper.setEyePos(player, newEyePos, newEyePos);
+        McHelper.updateBoundingBox(player);
+        
+        player.setServerLevel(toWorld);
+        
+        // adds the player
+        toWorld.addDuringTeleport(player);
+        
+        if (vehicle != null) {
+            // RS (d) instrument: this is where a RIDDEN cart is carried. NOTE, corrected against
+            // the bytecode after a review caught the first version of this comment stating the
+            // opposite: getVehicleOffsetFromPassenger returns the PASSENGER'S ATTACHMENT VECTOR
+            // (McHelper:309-313 -> Entity.getVehicleAttachmentPoint -> the passenger's own
+            // EntityAttachment.VEHICLE), NOT a difference of live positions. The vehicle's
+            // near-level position is therefore DISCARDED, not carried: the cart is placed purely
+            // at player + attachment. A cart that derailed mid-crossing does not drag its
+            // corrupted Y across — but nor does a correct one contribute anything, which is why
+            // the arrival height is entirely the PLAYER's arrival height plus the attachment.
+            cartProbe(vehicle, "VEHICLE-CARRY-BEGIN (cross-dim; cart pos discarded, attachment used)");
+            Vec3 offset = McHelper.getVehicleOffsetFromPassenger(vehicle, player);
+            Vec3 vehiclePos = player.position().add(offset);
+            vehicle = teleportVehicleAcrossDimensions(
+                vehicle,
+                toWorld.dimension(),
+                vehiclePos.add(McHelper.getEyeOffset(vehicle))
+            );
+            McHelper.setPosAndLastTickPos(
+                vehicle,
+                player.position().add(offset),
+                McHelper.lastTickPosOf(player).add(offset)
+            );
+            ((IEServerPlayerEntity) player).ip_startRidingWithoutTeleportRequest(vehicle);
+            McHelper.adjustVehicle(player);
+            cartProbe(vehicle, "VEHICLE-CARRY-DONE (cross-dim)");
+        }
+        
+        if (IPConfig.getConfig().serverTeleportLogging) {
+            LOGGER.info(
+                "{} :: ({} {} {} {})->({} {} {} {})",
+                player.getName().getContents(),
+                fromWorld.dimension().identifier(),
+                oldPos.x(), oldPos.y(), oldPos.z(),
+                toWorld.dimension().identifier(),
+                (int) player.getX(), (int) player.getY(), (int) player.getZ()
+            );
+        }
+        
+        O_O.onPlayerTravelOnServer(
+            player,
+            fromWorld,
+            toWorld
+        );
+        
+        //update advancements
+        ((IEServerPlayerEntity) player).portal_worldChanged(fromWorld, oldPos);
+    }
+    
+    private void manageGlobalPortalTeleportation() {
+        for (ServerLevel world : MiscHelper.getServer().getAllLevels()) {
+            for (Entity entity : world.getAllEntities()) {
+                if (!(entity instanceof ServerPlayer)) {
+                    Portal collidingPortal = ((IEEntity) entity).ip_getCollidingPortal();
+                    
+                    if (collidingPortal != null && collidingPortal.getIsGlobal()) {
+                        if (shouldEntityTeleport(collidingPortal, entity)) {
+                            startTeleportingRegularEntity(collidingPortal, entity);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    public boolean isTeleporting(Entity entity) {
+        return teleportingEntities.contains(entity);
+    }
+    
+    private void teleportRegularEntity(Entity entity, Portal portal) {
+        Validate.isTrue(!(entity instanceof ServerPlayer));
+        if (entity.getRemovalReason() != null) {
+            LOGGER.error(
+                "Trying to teleport an entity that is already removed {} {}",
+                entity, portal
+            );
+            return;
+        }
+        
+        if (entity.level() != portal.level()) {
+            LOGGER.error("Cannot teleport {} from {} through {}", entity, entity.level().dimension(), portal);
+            return;
+        }
+        
+        if (portal.getDistanceToNearestPointInPortal(entity.getEyePosition()) > 5) {
+            LOGGER.error("Entity is too far to teleport {} {}", entity, portal);
+            return;
+        }
+        
+        long currGameTime = McHelper.getServerGameTime();
+        Long lastTeleportGameTime = this.lastTeleportGameTime.getOrDefault(entity, 0L);
+        if (currGameTime - lastTeleportGameTime <= 0) {
+            return;
+        }
+        this.lastTeleportGameTime.put(entity, currGameTime);
+        
+        if (entity.isPassenger() || doesEntityClusterContainPlayer(entity)) {
+            return;
+        }
+        
+        Vec3 velocity = entity.getDeltaMovement();
+        Vec3 oldPos = entity.position();
+
+        List<Entity> passengerList = entity.getPassengers();
+
+        // F6 — CONSERVE THE CROSSING AT SEAMS. IP's arrival rewinds the overshoot to
+        // plane-hit + 0.05, which at rail speeds yanks the cart up to ~2 blocks BACKWARD at the
+        // flip (the live hiccup). A seam's far side is continuous terrain by contract, so the
+        // through-transform of the ACTUAL position is always a valid arrival — position, and
+        // with it the whole visual path, continues exactly. Non-seam portals keep IP's rewind
+        // (their far side is a portal frame, not a continuation). Guard: the eye must actually
+        // be past the plane — a queued-but-not-crossed edge case falls back to the rewind.
+        boolean seamConserve = com.warwa.seamlessportals.passthrough.SeamCartContinuity
+            .isSeamContinuous(portal)
+            && !portal.isInFrontOfPortal(McHelper.getEyePos(entity));
+        Vec3 newEyePos = seamConserve
+            ? portal.transformPoint(McHelper.getEyePos(entity))
+            : getRegularEntityTeleportedEyePos(entity, portal);
+
+        cartProbe(entity, "TELEPORT-RUN-BEGIN (pre-transform)");
+
+        TeleportationUtil.transformEntityVelocity(
+            portal, entity, TeleportationUtil.PortalPointVelocity.ZERO, oldPos
+        );
+        
+        if (portal.getDestDim() != entity.level().dimension()) {
+            entity = changeEntityDimension(entity, portal.getDestDim(), newEyePos, true);
+
+            Entity newEntity = entity;
+
+            passengerList.stream().map(
+                e -> changeEntityDimension(e, portal.getDestDim(), newEyePos, true)
+            ).collect(Collectors.toList()).forEach(e -> {
+                e.startRiding(newEntity, true, false);
+            });
+        }
+        else {
+            // F5 rider fix (live 2026-08-11: "entities riding still clip"): the same-dim branch
+            // never moved the PASSENGERS — passengerList is only consumed by the cross-dim
+            // recreate above, so a mob rider stayed at the source for a whole tick (dragged over
+            // by positionRider only on the vehicle's next tick) and its client lerped the jump
+            // with no collision bookkeeping. Carry each rider through the portal transform in
+            // the same tick as its vehicle; positionRider exacts the attachment next tick.
+            for (Entity p : passengerList) {
+                Vec3 pNewEye = portal.transformPoint(McHelper.getEyePos(p));
+                McHelper.setEyePos(p, pNewEye, pNewEye);
+                McHelper.updateBoundingBox(p);
+                cartProbe(p, "RIDER-CARRIED same-dim (transform applied)");
+            }
+        }
+
+        McHelper.setEyePos(entity, newEyePos, newEyePos);
+        McHelper.updateBoundingBox(entity);
+        
+        // living entities do position interpolation
+        // it may interpolate into unloaded chunks and stuck
+        // avoid position interpolation
+        // F6: at a seam (conserved arrival) the RPC also carries the portal, so the client can
+        // REBASE its visual state through the transform instead of snap+cancel — a non-seam
+        // crossing sends the -1 sentinel and keeps the snap.
+        McHelper.sendToTrackers(
+            entity,
+            McRemoteProcedureCall.createPacketToSendToClient(
+                "qouteall.imm_ptl.core.teleportation.ClientTeleportationManager.RemoteCallables.updateEntityPos",
+                entity.level().dimension(),
+                entity.getId(),
+                entity.position(),
+                portal.level().dimension(),
+                seamConserve ? portal.getId() : -1
+            )
+        );
+
+        // F5 rider fix, part 2: each rider gets the same snap the vehicle gets — the client
+        // RPC kills its interpolation AND refreshes its collision bookkeeping (the seed inside
+        // updateEntityPos is entity-generic), so the rider is clipped and counterparted from
+        // its first arrived frame exactly like the cart. getPassengers() here holds the
+        // post-teleport objects on both branches (same-dim: the originals; cross-dim: the
+        // recreated, remounted ones).
+        cartProbe(entity, "RIDER-RPC fan: passengers=" + entity.getPassengers().size());
+        for (Entity p : entity.getPassengers()) {
+            cartProbe(p, "RIDER-RPC sent (5-arg updateEntityPos)");
+            McHelper.sendToTrackers(
+                p,
+                McRemoteProcedureCall.createPacketToSendToClient(
+                    "qouteall.imm_ptl.core.teleportation.ClientTeleportationManager.RemoteCallables.updateEntityPos",
+                    p.level().dimension(),
+                    p.getId(),
+                    p.position(),
+                    portal.level().dimension(),
+                    seamConserve ? portal.getId() : -1
+                )
+            );
+            PortalCollisionHandler.updateCollidingPortalAfterTeleportation(
+                p, McHelper.getEyePos(p), McHelper.getEyePos(p), 1
+            );
+        }
+
+        portal.onEntityTeleportedOnServer(entity);
+
+        ScaleUtils.onServerEntityTeleported(entity, portal);
+
+        // F5: refresh the arrived entity's portal-collision bookkeeping NOW instead of at the
+        // next END_SERVER_TICK sweep — the player paths do exactly this, regular entities never
+        // did. The arrival straddles the dest-side portal (eye + 0.05 past the plane), so for
+        // one tick its not-yet-crossed half depended on entries that didn't exist.
+        PortalCollisionHandler.updateCollidingPortalAfterTeleportation(
+            entity, McHelper.getEyePos(entity), McHelper.getEyePos(entity), 1
+        );
+
+        // a new entity may be created
+        this.lastTeleportGameTime.put(entity, currGameTime);
+
+        cartProbe(entity, "TELEPORT-RUN-DONE (post-move, post-transform)");
+    }
+    
+    private static Vec3 getRegularEntityTeleportedEyePos(Entity entity, Portal portal) {
+        // the teleportation is delayed by 1 tick
+        // the entity may be behind the portal or in front of the portal at this time
+        
+        Vec3 eyePosThisTick = McHelper.getEyePos(entity);
+        Vec3 eyePosLastTick = McHelper.getLastTickEyePos(entity);
+        
+        Vec3 deltaMovement = eyePosThisTick.subtract(eyePosLastTick);
+        Vec3 deltaMovementDirection = deltaMovement.normalize();
+        
+        Vec3 collidingPoint = portal.rayTrace(
+            eyePosThisTick.subtract(deltaMovementDirection.scale(5)),
+            eyePosThisTick.add(deltaMovementDirection)
+        );
+        
+        if (collidingPoint == null) {
+            collidingPoint = eyePosLastTick;
+        }
+        
+        Vec3 result = portal.transformPoint(collidingPoint)
+            .add(deltaMovementDirection.scale(0.05));
+        return result;
+    }
+    
+    /**
+     * {@link Entity#changeDimension}
+     * Sometimes resuing the same entity object is problematic
+     * because entity's AI related things may have world reference inside
+     */
+    @SuppressWarnings({"resource", "UnnecessaryLocalVariable"})
+    public Entity changeEntityDimension(
+        Entity entity,
+        ResourceKey<Level> toDimension,
+        Vec3 newEyePos,
+        boolean recreateEntity
+    ) {
+        if (entity.getRemovalReason() != null) {
+            LOGGER.error("Trying to teleport a removed entity {}", entity, new Throwable());
+            return entity;
+        }
+        
+        MinecraftServer server = entity.level().getServer();
+        Validate.notNull(server, "server is null");
+        
+        ServerLevel fromWorld = (ServerLevel) entity.level();
+        ServerLevel toWorld = server.getLevel(toDimension);
+        
+        if (toWorld == null) {
+            LOGGER.error(
+                "Invalid dest dimension {} to teleport entity {} to",
+                toDimension.identifier(), entity
+            );
+            return entity;
+        }
+        
+        entity.unRide();
+        
+        if (recreateEntity) {
+            Entity oldEntity = entity;
+            Entity newEntity;
+            newEntity = entity.getType().create(toWorld, EntitySpawnReason.DIMENSION_TRAVEL);
+            if (newEntity == null) {
+                return oldEntity;
+            }
+            
+            newEntity.restoreFrom(oldEntity);
+            newEntity.setId(oldEntity.getId());
+            McHelper.setEyePos(newEntity, newEyePos, newEyePos);
+            McHelper.updateBoundingBox(newEntity);
+            newEntity.setYHeadRot(oldEntity.getYHeadRot());
+            preserveTransientHurtState(oldEntity, newEntity);
+
+            // TODO check minecart item duplication
+            oldEntity.remove(Entity.RemovalReason.CHANGED_DIMENSION);
+            
+            toWorld.addDuringTeleport(newEntity);
+            
+            return newEntity;
+        }
+        else {
+            entity.remove(Entity.RemovalReason.CHANGED_DIMENSION);
+            ((IEEntity) entity).ip_unsetRemoved();
+            
+            McHelper.setEyePos(entity, newEyePos, newEyePos);
+            McHelper.updateBoundingBox(entity);
+            
+            ((IEEntity) entity).ip_setWorld(toWorld);
+            
+            toWorld.addDuringTeleport(entity);
+            
+            Validate.isTrue(!entity.isRemoved());
+            
+            return entity;
+        }
+    }
+    
+    public Entity teleportVehicleAcrossDimensions(
+        Entity entity,
+        ResourceKey<Level> toDimension,
+        Vec3 newEyePos
+    ) {
+        // avoid sending the remove entity packet
+        teleportingEntities.add(entity);
+        
+        ServerLevel fromWorld = (ServerLevel) entity.level();
+        ServerLevel toWorld = MiscHelper.getServer().getLevel(toDimension);
+        
+        Entity oldEntity = entity;
+        Entity newEntity;
+        newEntity = entity.getType().create(toWorld, EntitySpawnReason.DIMENSION_TRAVEL);
+        Validate.isTrue(newEntity != null);
+        
+        newEntity.restoreFrom(oldEntity);
+        newEntity.setId(oldEntity.getId());
+        McHelper.setEyePos(newEntity, newEyePos, newEyePos);
+        McHelper.updateBoundingBox(newEntity);
+        newEntity.setYHeadRot(oldEntity.getYHeadRot());
+        // F3: living vehicles (horse/camel/strider) lose transient hurt state at this
+        // second restoreFrom site too — same patch as changeEntityDimension (rule: any
+        // per-entity-type crossing behavior exists in EVERY crossing path).
+        preserveTransientHurtState(oldEntity, newEntity);
+
+        oldEntity.remove(Entity.RemovalReason.CHANGED_DIMENSION);
+        ((IEEntity) oldEntity).ip_unsetRemoved();
+
+        toWorld.addDuringTeleport(newEntity);
+
+        return newEntity;
+    }
+
+    /**
+     * F3 (EXECUTION_PLAN §Deviations, reproduce-then-patch; reproduced on this path
+     * 2026-07-18 — CrossingSmoke leg 3 RED, commit 306ab5d): carry a mob's TRANSIENT
+     * hurt/panic state across the recreate. {@code restoreFrom} is an NBT round-trip;
+     * fields with no save codec reset to default on the new object. The critical one is
+     * {@code lastDamageSource} (+ its {@code lastDamageStamp} 40-tick window):
+     * {@code PanicGoal.shouldPanic()} reads {@code getLastDamageSource() != null}
+     * (LivingEntity:1419), so on the recreated mob it is null → panic never starts → a
+     * shot animal stops fleeing the instant it crosses (the block-era mod's paid-for fix,
+     * PortalTeleporter.preserveTransientHurtState, ported 1:1).
+     *
+     * <p>{@code lastDamageStamp} is compared against the SHARED server
+     * {@code getGameTime()}, so it is copied RAW (no rebase). The stale cross-dim entity
+     * ref inside the copied {@code lastDamageSource} is dereferenced only by consumers
+     * that self-heal or tolerate cross-dim refs ({@code PanicGoal} reads just the
+     * damage-TYPE tag; {@code HurtBySensor} erases a wrong-level HURT_BY_ENTITY itself —
+     * and vanilla keeps the same stale ref when an ATTACKER changes dimension, so this is
+     * vanilla-equivalent staleness). Velocity/knockback is already carried by
+     * {@code transformEntityVelocity}; not touched here. The new entity has not ticked
+     * yet, so these plain field writes are race-free. Items/XP/projectiles are skipped by
+     * the type guard.
+     *
+     * <p>The brain {@code HURT_BY} copy MUST stay guarded by {@code hasMemoryValue}:
+     * {@code Brain.getMemory} THROWS {@code IllegalStateException} on an UNREGISTERED
+     * slot, and plain goal-AI farm animals (cow, chicken, pig, sheep — exactly the mobs
+     * this fix targets) use the default empty brain with no HURT_BY slot; an unguarded
+     * getMemory would crash the crossing tick. {@code hasMemoryValue} returns false (no
+     * throw) when the slot is absent; the new entity is the same type, so when the old
+     * brain has the slot the new brain has it too.
+     */
+    private static void preserveTransientHurtState(Entity oldEntity, Entity newEntity) {
+        if (!(oldEntity instanceof net.minecraft.world.entity.LivingEntity oldL)
+            || !(newEntity instanceof net.minecraft.world.entity.LivingEntity newL)) {
+            return;
+        }
+        com.warwa.seamlessportals.mixin.LivingEntityHurtAccessor oldA =
+            (com.warwa.seamlessportals.mixin.LivingEntityHurtAccessor) oldL;
+        com.warwa.seamlessportals.mixin.LivingEntityHurtAccessor newA =
+            (com.warwa.seamlessportals.mixin.LivingEntityHurtAccessor) newL;
+        // The panic trigger (the reported bug).
+        newA.seamlessportals$setLastDamageSource(oldA.seamlessportals$getLastDamageSource());
+        newA.seamlessportals$setLastDamageStamp(oldA.seamlessportals$getLastDamageStamp());
+        // Completeness: i-frames + the red-hurt flash stay consistent.
+        newA.seamlessportals$setLastHurt(oldA.seamlessportals$getLastHurt());
+        newL.hurtTime = oldL.hurtTime;          // serialized in 26.2 ("HurtTime"); kept paired, not load-bearing
+        newL.hurtDuration = oldL.hurtDuration;  // not serialized
+        newL.setInvulnerableTime(oldL.getInvulnerableTime()); // not serialized — 26.3: field went private, same value via the new accessors (mc263-ref Entity.java:255,4214,4218)
+        // Brain-based panic (villagers, axolotls, ...): HURT_BY has no codec, so the
+        // persisted-memory NBT round-trip drops it — copy it live. (Brain.setMemory
+        // silently no-ops on an unregistered slot, so the new-brain write is safe even
+        // if the same-type assumption were ever violated.)
+        if (oldL.getBrain().hasMemoryValue(
+            net.minecraft.world.entity.ai.memory.MemoryModuleType.HURT_BY)) {
+            oldL.getBrain()
+                .getMemory(net.minecraft.world.entity.ai.memory.MemoryModuleType.HURT_BY)
+                .ifPresent(src -> newL.getBrain()
+                    .setMemory(net.minecraft.world.entity.ai.memory.MemoryModuleType.HURT_BY, src));
+        }
+    }
+    
+    private boolean doesEntityClusterContainPlayer(Entity entity) {
+        if (entity instanceof Player) {
+            return true;
+        }
+        List<Entity> passengerList = entity.getPassengers();
+        if (passengerList.isEmpty()) {
+            return false;
+        }
+        return passengerList.stream().anyMatch(this::doesEntityClusterContainPlayer);
+    }
+    
+    public boolean isJustTeleported(Entity entity, long valveTickTime) {
+        long currGameTime = McHelper.getServerGameTime();
+        Long lastTeleportGameTime = this.lastTeleportGameTime.getOrDefault(entity, -100000L);
+        return currGameTime - lastTeleportGameTime < valveTickTime;
+    }
+    
+    public static Entity teleportEntityGeneral(Entity entity, Vec3 targetPos, ServerLevel targetWorld) {
+        if (entity instanceof ServerPlayer serverPlayer) {
+            of(serverPlayer.level().getServer()).forceTeleportPlayer(
+                serverPlayer, targetWorld.dimension(), targetPos
+            );
+            return entity;
+        }
+        else {
+            return teleportRegularEntityTo(entity, targetWorld.dimension(), targetPos);
+        }
+    }
+    
+    @SuppressWarnings("unchecked")
+    public static <E extends Entity> E teleportRegularEntityTo(
+        E entity, ResourceKey<Level> targetDim, Vec3 targetPos
+    ) {
+        if (entity.level().dimension() == targetDim) {
+            entity.snapTo(
+                targetPos.x,
+                targetPos.y,
+                targetPos.z,
+                entity.getYRot(),
+                entity.getXRot()
+            );
+            entity.setYHeadRot(entity.getYRot());
+            return entity;
+        }
+        
+        return (E) of(entity.level().getServer()).changeEntityDimension(
+            entity,
+            targetDim,
+            targetPos.add(McHelper.getEyeOffset(entity)),
+            true
+        );
+    }
+    
+    // make the mobs chase the player through portal
+    // (only works in simple cases)
+    private static void notifyChasersForPlayer(
+        ServerPlayer player,
+        Portal portal
+    ) {
+        List<Mob> chasers = McHelper.findEntitiesRough(
+            Mob.class,
+            player.level(),
+            player.position(),
+            1,
+            e -> e.getTarget() == player
+        );
+        
+        for (Mob chaser : chasers) {
+            chaser.setTarget(null);
+            notifyChaser(player, portal, chaser);
+        }
+    }
+    
+    private static void notifyChaser(
+        ServerPlayer player,
+        Portal portal,
+        Mob chaser
+    ) {
+        Vec3 targetPos = player.position().add(portal.getNormal().scale(-0.1));
+        
+        UUID chaserId = chaser.getUUID();
+        ServerLevel destWorld = ((ServerLevel) portal.getDestinationWorld());
+        
+        ServerTaskList.of(player.level().getServer()).addTask(MyTaskList.withRetryNumberLimit(
+            140,
+            () -> {
+                if (chaser.isRemoved()) {
+                    // the chaser teleported
+                    Entity newChaser = destWorld.getEntity(chaserId);
+                    if (newChaser instanceof Mob) {
+                        ((Mob) newChaser).setTarget(player);
+                        return true;
+                    }
+                    else {
+                        return false;
+                    }
+                }
+                
+                if (chaser.position().distanceTo(targetPos) < 2) {
+                    chaser.getMoveControl().setWantedPosition(
+                        targetPos.x, targetPos.y, targetPos.z, 1
+                    );
+                }
+                else {
+                    @Nullable
+                    Path path = chaser.getNavigation().createPath(
+                        BlockPos.containing(targetPos), 0
+                    );
+                    chaser.getNavigation().moveTo(path, 1);
+                }
+                return false;
+            },
+            () -> {}
+        ));
+    }
+    
+    private void evacuatePlayersFromDimension(ServerLevel world) {
+        // teleportation modifies the player list
+        List<ServerPlayer> players = new ArrayList<>(
+            MiscHelper.getServer().getPlayerList().getPlayers()
+        );
+        for (ServerPlayer player : players) {
+            if (player.level().dimension() == world.dimension()) {
+                ServerLevel overWorld = McHelper.getOverWorldOnServer();
+                BlockPos spawnPos = overWorld.getRespawnData().pos();
+                
+                forceTeleportPlayer(
+                    player, Level.OVERWORLD, Vec3.atCenterOf(spawnPos)
+                );
+                
+                player.sendSystemMessage(Component.literal(
+                    "Teleported to spawn pos because dimension %s had been removed".formatted(world.dimension().identifier())
+                ));
+            }
+        }
+    }
+}

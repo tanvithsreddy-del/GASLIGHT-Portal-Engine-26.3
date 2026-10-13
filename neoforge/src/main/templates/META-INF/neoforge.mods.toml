@@ -1,0 +1,69 @@
+license="${mod_license}"
+
+[[mods]]
+modId="${mod_id}"
+version="${mod_version}"
+displayName="${mod_name}"
+description='''${mod_description}'''
+# Mod-list icon (2026-08-30): the mod's OWN icon (user-supplied), shared with fabric.mod.json —
+# ships in both jars via :common resources, addressed from the jar root.
+# 26.3: was `logoFile`. NeoForge 26.3 deprecates that key — javap neoforge-26.3.0.7-beta-universal.jar
+# net.neoforged.neoforge.internal.LogoFileWarningsHandler: in a dev run, a mod with `logoFile` and neither `bannerFile`
+# nor `iconFile` gets a mod-loading WARNING ("uses the deprecated `logoFile` property; change to `bannerFile` and/or
+# (for square icons) `iconFile`") and the "Warning while loading mods" screen on every boot. The icon is square
+# (256x256), so `iconFile`; client/gui/modlist/DefaultModDisplayInfo reads `iconFile` first for the mod list.
+iconFile="assets/seamlessportals/icon.png"
+
+[[mixins]]
+config = "seamlessportals-common.mixins.json"
+
+[[mixins]]
+config = "seamlessportals-ip-qmisc.mixins.json"
+
+[[mixins]]
+config = "seamlessportals-ip-core-common.mixins.json"
+
+[[mixins]]
+config = "seamlessportals-ip-client.mixins.json"
+
+# NF-PARITY W16 (2026-08-25): the S16 "NEAR-inert on NeoForge" era is OVER — the W23 flag
+# retirement means EntityPortalsFlag resolves identically on both loaders (default ON since
+# S17), so the qouteall.* mixin sets weave here exactly as on Fabric. The D3 carve-out notes
+# (worldgen accessors, item datafix) remain accurate in both flag states.
+[[mixins]]
+config = "seamlessportals-ip-peripheral.mixins.json"
+
+# NF-PARITY W16: renamed from seamlessportals-ip-fabric.mixins.json — the name was a misnomer
+# (both mixins target vanilla PlayerList/ServerPlayer, zero net.fabricmc references; NeoForge's
+# patches to both targets are purely additive). Deliberately NOT rewritten onto NeoForge events:
+# PlayerList.respawn HEAD fires BEFORE players.remove/removePlayerImmediately, which the event
+# route (firePlayerRespawnPositionEvent, PlayerList.java:405) loses. Ordering note: both mixins
+# call ImmPtlChunkTracking/ServerTaskList — those are wired by the W9 facade, landed before this.
+[[mixins]]
+config = "seamlessportals-ip-platform.mixins.json"
+
+[[dependencies.${mod_id}]]
+    modId="neoforge"
+    type="required"
+    versionRange="${neo_version_range}"
+    ordering="NONE"
+    side="BOTH"
+
+[[dependencies.${mod_id}]]
+    modId="minecraft"
+    type="required"
+    versionRange="${minecraft_version_range}"
+    ordering="NONE"
+    side="BOTH"
+
+[[mixins]]
+config = "seamlessportals-ip-dimlib.mixins.json"
+
+# C2-0 (migration/C2_DESIGN.md §6.1/§6.3): the real Sodium/Iris compat config. Listed on both
+# loaders because it ships in :common. NF-PARITY W17 (2026-08-25): no longer blanket-inert —
+# with the flag defaulting ON here, IPCompatMixinPlugin's gates decide per-mod: gate 1 is the
+# (LoadingModList-fixed) sodium/iris presence probe, gate 2 the entityPortals flag. First-party
+# Sodium/Iris publish -neoforge builds under the SAME mod ids and (verified by jar listing) the
+# SAME loader-neutral target packages, so present+flag-ON weaves the compat set here too.
+[[mixins]]
+config = "seamlessportals-ip-compat.mixins.json"

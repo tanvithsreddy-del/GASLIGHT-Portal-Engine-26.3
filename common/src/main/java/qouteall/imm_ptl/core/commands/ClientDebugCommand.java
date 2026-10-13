@@ -1,0 +1,1182 @@
+package qouteall.imm_ptl.core.commands;
+
+import com.mojang.brigadier.CommandDispatcher;
+import com.mojang.brigadier.arguments.DoubleArgumentType;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.arguments.StringArgumentType;
+import com.mojang.brigadier.builder.LiteralArgumentBuilder;
+import com.mojang.brigadier.builder.RequiredArgumentBuilder;
+import com.mojang.brigadier.context.CommandContext;
+import com.mojang.brigadier.exceptions.CommandSyntaxException;
+import com.mojang.datafixers.util.Pair;
+import com.warwa.seamlessportals.platform.ClientPlatform;
+import net.fabricmc.api.EnvType;
+import net.fabricmc.api.Environment;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.SectionPos;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.IntTag;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.level.ThreadedLevelLightEngine;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.LightLayer;
+import net.minecraft.world.level.biome.Biome;
+import net.minecraft.world.level.biome.Biomes;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.NetherPortalBlock;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.ChunkAccess;
+import net.minecraft.world.level.chunk.DataLayer;
+import net.minecraft.world.level.chunk.EmptyLevelChunk;
+import net.minecraft.world.level.entity.EntityTickList;
+import net.minecraft.world.phys.Vec3;
+import qouteall.imm_ptl.core.CHelper;
+import qouteall.imm_ptl.core.ClientWorldLoader;
+import qouteall.imm_ptl.core.IPCGlobal;
+import qouteall.imm_ptl.core.IPGlobal;
+import qouteall.imm_ptl.core.McHelper;
+import qouteall.imm_ptl.core.ducks.IEClientWorld;
+import qouteall.imm_ptl.core.ducks.IEEntity;
+import qouteall.imm_ptl.core.ducks.IEWorldRenderer;
+import qouteall.imm_ptl.core.platform_specific.IPConfig;
+import qouteall.imm_ptl.core.platform_specific.IPConfigGUI;
+import qouteall.imm_ptl.core.platform_specific.O_O;
+import qouteall.imm_ptl.core.portal.Portal;
+import qouteall.imm_ptl.core.render.ForceMainThreadRebuild;
+import qouteall.imm_ptl.core.render.ImmPtlViewArea;
+import qouteall.imm_ptl.core.render.MyGameRenderer;
+import qouteall.imm_ptl.core.render.context_management.RenderStates;
+import qouteall.imm_ptl.core.teleportation.ClientTeleportationManager;
+import qouteall.q_misc_util.Helper;
+import qouteall.q_misc_util.MiscHelper;
+import qouteall.q_misc_util.api.McRemoteProcedureCall;
+import qouteall.q_misc_util.my_util.MyTaskList;
+
+import java.lang.ref.WeakReference;
+import java.net.URLClassLoader;
+import java.util.Arrays;
+import java.util.List;
+import java.util.UUID;
+import java.util.function.Consumer;
+import java.util.stream.Collectors;
+
+// 26.2 port deltas from IP 1.21.3 (entity-portal migration S13-A; port-note S13A-u11.md):
+//  - fabric-command-api-v2 3.1.0 renamed ClientCommandManager -> ClientCommands (client-command
+//    builder factory); every ClientCommandManager.literal/argument becomes ClientCommands.* (F2).
+//  - ResourceKey.location() -> identifier() (global ResourceLocation -> Identifier rename;
+//    ducks-api-misc.md); the dimension().location() reads become .identifier().
+//  - net.minecraft.resources.ResourceLocation -> Identifier (import + TestRemoteCallable param).
+//  - Minecraft.setScreen(Screen) moved to Gui.setScreen (ducks-api-misc.md C3); the config-screen
+//    open becomes client.gui.setScreen(...), matching the committed CHelper convention.
+// Everything else (Brigadier tree, RPC endpoints, light-debug/render-debug calls) ports verbatim.
+@Environment(EnvType.CLIENT)
+public class ClientDebugCommand {
+    
+    // NF-PARITY W11: source-generic <S>; ClientCommands.* -> brigadier builders; feedback via ClientCommandSupport
+    public static <S> void register(
+        CommandDispatcher<S> dispatcher, ClientPlatform.ClientCommandSupport<S> support
+    ) {
+        LiteralArgumentBuilder<S> builder = LiteralArgumentBuilder
+            .<S>literal("imm_ptl_client_debug")
+            .requires(commandSource -> true)
+            .then(LiteralArgumentBuilder
+                .<S>literal("set_max_portal_layer")
+                .then(RequiredArgumentBuilder
+                    .<S, Integer>argument(
+                        "argMaxPortalLayer", IntegerArgumentType.integer()
+                    )
+                    .executes(context -> setMaxPortalLayer(
+                        IntegerArgumentType.getInteger(context, "argMaxPortalLayer")
+                    ))
+                )
+            );
+        builder = builder.then(LiteralArgumentBuilder
+            .<S>literal("list_portals")
+            .executes(context -> {
+                RemoteCallables.doListPortals();
+                return 0;
+            })
+        );
+        builder = builder.then(LiteralArgumentBuilder
+            .<S>literal("is_client_chunk_loaded")
+            .then(RequiredArgumentBuilder
+                .<S, Integer>argument(
+                    "chunkX", IntegerArgumentType.integer()
+                )
+                .then(RequiredArgumentBuilder
+                    .<S, Integer>argument(
+                        "chunkZ", IntegerArgumentType.integer()
+                    )
+                    .executes(
+                        ClientDebugCommand::isClientChunkLoaded
+                    )
+                )
+            )
+        );
+        
+        builder = builder.then(LiteralArgumentBuilder
+            .<S>literal("report_player_status")
+            .executes(context -> {
+                RemoteCallables.reportClientPlayerStatus();
+                return 0;
+            })
+        );
+        builder = builder.then(LiteralArgumentBuilder
+            .<S>literal("client_remote_ticking_enable")
+            .executes(context -> {
+                IPCGlobal.isClientRemoteTickingEnabled = true;
+                return 0;
+            })
+        );
+        builder = builder.then(LiteralArgumentBuilder
+            .<S>literal("client_remote_ticking_disable")
+            .executes(context -> {
+                IPCGlobal.isClientRemoteTickingEnabled = false;
+                return 0;
+            })
+        );
+        builder = builder.then(LiteralArgumentBuilder
+            .<S>literal("advanced_frustum_culling_enable")
+            .executes(context -> {
+                IPCGlobal.doUseAdvancedFrustumCulling = true;
+                return 0;
+            })
+        );
+        builder = builder.then(LiteralArgumentBuilder
+            .<S>literal("advanced_frustum_culling_disable")
+            .executes(context -> {
+                IPCGlobal.doUseAdvancedFrustumCulling = false;
+                return 0;
+            })
+        );
+//        builder = builder.then(ClientCommands
+//            .literal("hacked_chunk_render_dispatcher_enable")
+//            .executes(context -> {
+//                IPCGlobal.useHackedChunkRenderDispatcher = true;
+//                return 0;
+//            })
+//        );
+//        builder = builder.then(ClientCommands
+//            .literal("hacked_chunk_render_dispatcher_disable")
+//            .executes(context -> {
+//                IPCGlobal.useHackedChunkRenderDispatcher = false;
+//                return 0;
+//            })
+//        );
+        builder = builder.then(LiteralArgumentBuilder
+            .<S>literal("report_resource_consumption")
+            .executes(context1 -> {
+                RemoteCallables.reportResourceConsumption();
+                
+                return 0;
+            })
+        );
+        builder = builder.then(LiteralArgumentBuilder
+            .<S>literal("get_player_colliding_portal_client")
+            .executes(context -> {
+                Portal collidingPortal =
+                    ((IEEntity) Minecraft.getInstance().player).ip_getCollidingPortal();
+                CHelper.printChat(
+                    collidingPortal != null ? collidingPortal.toString() : "null"
+                );
+                return 0;
+            })
+        );
+        builder = builder.then(LiteralArgumentBuilder
+            .<S>literal("report_rendering")
+            .executes(context -> {
+                StringBuilder sb = new StringBuilder();
+                for (List<WeakReference<Portal>> rendering : RenderStates.lastPortalRenderInfos) {
+                    sb.append("----------\n");
+                    for (WeakReference<Portal> portalLikeWeakReference : rendering) {
+                        sb.append(portalLikeWeakReference.get().toString());
+                        sb.append("\n");
+                    }
+                }
+                CHelper.printChat(sb.toString());
+                return 0;
+            })
+        );
+        
+        builder.then(LiteralArgumentBuilder.<S>literal("report_loaded_portals")
+            .executes(context -> {
+                for (ClientLevel world : ClientWorldLoader.getClientWorlds()) {
+                    EntityTickList entityList = ((IEClientWorld) world).ip_getEntityList();
+                    entityList.forEach(e -> {
+                        if (e instanceof Portal portal) {
+                            CHelper.printChat(portal.toString());
+                        }
+                    });
+                }
+                return 0;
+            })
+        );
+        
+        builder = builder.then(LiteralArgumentBuilder
+            .<S>literal("vanilla_chunk_culling_enable")
+            .executes(context -> {
+                Minecraft.getInstance().smartCull = true;
+                return 0;
+            })
+        );
+        builder = builder.then(LiteralArgumentBuilder
+            .<S>literal("vanilla_chunk_culling_disable")
+            .executes(context -> {
+                Minecraft.getInstance().smartCull = false;
+                return 0;
+            })
+        );
+        builder = builder.then(LiteralArgumentBuilder
+            .<S>literal("render_mode_normal")
+            .executes(context -> {
+                IPGlobal.renderMode = IPGlobal.RenderMode.normal;
+                return 0;
+            })
+        );
+        builder = builder.then(LiteralArgumentBuilder
+            .<S>literal("render_mode_compatibility")
+            .executes(context -> {
+                IPGlobal.renderMode = IPGlobal.RenderMode.compatibility;
+                return 0;
+            })
+        );
+        builder = builder.then(LiteralArgumentBuilder
+            .<S>literal("render_mode_debug")
+            .executes(context -> {
+                IPGlobal.renderMode = IPGlobal.RenderMode.debug;
+                return 0;
+            })
+        );
+        builder = builder.then(LiteralArgumentBuilder
+            .<S>literal("render_mode_none")
+            .executes(context -> {
+                IPGlobal.renderMode = IPGlobal.RenderMode.none;
+                return 0;
+            })
+        );
+        
+        builder.then(LiteralArgumentBuilder
+            .<S>literal("check_client_light")
+            .executes(context -> {
+                Minecraft client = Minecraft.getInstance();
+                client.execute(() -> {
+                    client.level.getChunkSource().getLightEngine().updateSectionStatus(
+                        SectionPos.of(BlockPos.containing(client.player.position())),
+                        false
+                    );
+                });
+                return 0;
+            })
+        );
+        builder.then(LiteralArgumentBuilder
+            .<S>literal("report_client_entities")
+            .executes(context -> {
+                ClientLevel world = Minecraft.getInstance().level;
+                
+                CHelper.printChat("client entity manager:");
+                
+                for (Entity entity : world.entitiesForRendering()) {
+                    CHelper.printChat(entity.toString());
+                }
+                
+                CHelper.printChat("client entity list:");
+                
+                EntityTickList entityList = ((IEClientWorld) world).ip_getEntityList();
+                
+                entityList.forEach(e -> {
+                    CHelper.printChat(e.toString());
+                });
+                
+                return 0;
+            })
+        );
+        builder.then(LiteralArgumentBuilder
+            .<S>literal("check_server_light")
+            .executes(context -> {
+                MinecraftServer server = MiscHelper.getServer();
+                server.execute(() -> {
+                    ServerPlayer player = server.getPlayerList().getPlayers().get(0);
+                    
+                    BlockPos.betweenClosedStream(
+                        player.blockPosition().offset(-2, -2, -2),
+                        player.blockPosition().offset(2, 2, 2)
+                    ).forEach(blockPos -> {
+                        player.level().getLightEngine().checkBlock(blockPos);
+                    });
+                });
+                return 0;
+            })
+        );
+        builder.then(LiteralArgumentBuilder
+                .<S>literal("update_server_light")
+                .executes(context -> {
+                    MinecraftServer server = MiscHelper.getServer();
+                    server.execute(() -> {
+                        ServerPlayer player = server.getPlayerList().getPlayers().get(0);
+                        
+                        ThreadedLevelLightEngine lightingProvider = (ThreadedLevelLightEngine) player.level().getLightEngine();
+                        lightingProvider.lightChunk(
+                            player.level().getChunk(player.blockPosition()),
+                            false
+                        );
+//                    lightingProvider.light(
+//                        player.world.getChunk(player.chunkX, player.chunkZ),
+//                        true
+//                    );
+                    });
+                    return 0;
+                })
+        );
+        
+        builder.then(LiteralArgumentBuilder
+            .<S>literal("report_rebuild_status")
+            .executes(context -> {
+                Minecraft.getInstance().execute(() -> {
+                    ClientWorldLoader.getClientWorlds().forEach((world) -> {
+                        // C2-1b sodium yield (IgnoringViewArea — sodium owns terrain): under
+                        // Sodium the viewArea is sodium's IgnoringViewArea (the S12 install
+                        // redirect never runs — sodium$replace HEAD-cancels its enclosing
+                        // method), so the bare cast was a user-invokable CCE.
+                        // C2-1c vB fold: the fallback names sodium only when sodium is actually
+                        // the reason — the field is also legitimately NULL before the dim's
+                        // first extract (26.2 defers viewArea creation into extract), sodium
+                        // present or not.
+                        net.minecraft.client.renderer.ViewArea rawStorage =
+                            ((IEWorldRenderer) ClientWorldLoader.getWorldRenderer(world.dimension()))
+                                .ip_getBuiltChunkStorage();
+                        if (rawStorage instanceof ImmPtlViewArea builtChunkStorage) {
+                            CHelper.printChat(
+                                world.dimension().identifier().toString() + builtChunkStorage.getDebugString()
+                            );
+                        }
+                        else {
+                            CHelper.printChat(
+                                world.dimension().identifier().toString()
+                                    + (rawStorage == null
+                                        ? " (no viewArea yet — created at the dim's first extract)"
+                                        : " (no ImmPtlViewArea — sodium owns terrain)")
+                            );
+                        }
+                    });
+                });
+                
+                return 0;
+            })
+        );
+        
+        builder.then(LiteralArgumentBuilder
+            .<S>literal("report_client_light_status")
+            .executes(context -> {
+                Minecraft.getInstance().execute(() -> {
+                    LocalPlayer player = Minecraft.getInstance().player;
+                    DataLayer lightSection = player.level().getLightEngine().getLayerListener(LightLayer.BLOCK).getDataLayerData(
+                        SectionPos.of(player.blockPosition())
+                    );
+                    if (lightSection != null) {
+                        boolean uninitialized = lightSection.isEmpty();
+                        
+                        byte[] byteArray = lightSection.getData();
+                        boolean allZero = true;
+                        for (byte b : byteArray) {
+                            if (b != 0) {
+                                allZero = false;
+                                break;
+                            }
+                        }
+                        
+                        support.sendFeedback(context.getSource(),
+                            Component.literal(
+                                "has light section " +
+                                    (allZero ? "all zero" : "not all zero") +
+                                    (uninitialized ? " uninitialized" : " fine")
+                            )
+                        );
+                    }
+                    else {
+                        support.sendFeedback(context.getSource(),
+                            Component.literal("does not have light section")
+                        );
+                    }
+                });
+                return 0;
+            })
+        );
+        
+        builder.then(LiteralArgumentBuilder
+            .<S>literal("reload_world_renderer")
+            .executes(context -> {
+                Minecraft.getInstance().execute(() -> {
+                    ClientWorldLoader.disposeRenderHelpers();
+                    // 26.2: the "reload all chunk meshes" op moved off LevelRenderer onto the
+                    // LevelExtractor (Minecraft.levelExtractor.allChanged(), LevelExtractor.java:406;
+                    // vanilla itself reloads via this.levelExtractor.allChanged(), Minecraft.java:1047).
+                    Minecraft.getInstance().levelExtractor.allChanged();
+                });
+                return 0;
+            })
+        );
+        
+        builder.then(LiteralArgumentBuilder
+            .<S>literal("config")
+            .executes(context -> {
+                // works without modmenu
+                Minecraft client = Minecraft.getInstance();
+                
+                IPGlobal.CLIENT_TASK_LIST.addTask(MyTaskList.oneShotTask(() -> {
+                    client.gui.setScreen(IPConfigGUI.createClothConfigScreen(null));
+                }));
+                return 0;
+            })
+        );
+        
+        builder.then(LiteralArgumentBuilder
+            .<S>literal("disable_warning")
+            .executes(context -> {
+                disableWarning();
+                support.sendFeedback(context.getSource(), Component.translatable("imm_ptl.warning_disabled"));
+                return 0;
+            })
+        );
+        
+        builder.then(LiteralArgumentBuilder
+            .<S>literal("disable_warning_for")
+            .then(RequiredArgumentBuilder
+                .<S, String>argument("warningKey", StringArgumentType.string())
+                .executes(context -> {
+                    disableWarningFor(StringArgumentType.getString(context, "warningKey"));
+                    support.sendFeedback(context.getSource(), Component.translatable("imm_ptl.warning_disabled"));
+                    return 0;
+                })
+            )
+        );
+        
+        builder.then(LiteralArgumentBuilder
+            .<S>literal("disable_update_check")
+            .executes(context -> {
+                disableUpdateCheck();
+                support.sendFeedback(context.getSource(), Component.translatable("imm_ptl.update_check_disabled"));
+                return 0;
+            })
+        );
+        
+        builder.then(LiteralArgumentBuilder
+            .<S>literal("view_portal_data")
+            .executes(context -> {
+                Minecraft client = Minecraft.getInstance();
+                Pair<Portal, Vec3> pair = PortalCommand.getPlayerPointingPortalRaw(
+                    client.player, 0, 50, true
+                ).orElse(null);
+                if (pair != null) {
+                    Portal portal = pair.getFirst();
+                    PortalCommand.sendPortalInfo(
+                        c -> {
+                            support.sendFeedback(context.getSource(), c);
+                            Helper.log(c.getString());
+                            // if the data is too long, the in-game message will be chopped
+                            // so also print that in log
+                        },
+                        portal
+                    );
+                }
+                else {
+                    support.sendFeedback(context.getSource(), Component.literal("No pointing to a portal."));
+                }
+                return 0;
+            })
+        );
+        
+        // this command is used for testing server-side position validation
+        // only usable on dev env
+        if (O_O.isDevEnv()) {
+            builder.then(LiteralArgumentBuilder
+                .<S>literal("tp_on_client_side")
+                .then(RequiredArgumentBuilder.<S, String>argument("dim_id", StringArgumentType.string())
+                    .then(RequiredArgumentBuilder.<S, Double>argument("x", DoubleArgumentType.doubleArg())
+                        .then(RequiredArgumentBuilder.<S, Double>argument("y", DoubleArgumentType.doubleArg())
+                            .then(RequiredArgumentBuilder.<S, Double>argument("z", DoubleArgumentType.doubleArg())
+                                .executes(context -> {
+                                    String dimId = StringArgumentType.getString(context, "dim_id");
+                                    double x = DoubleArgumentType.getDouble(context, "x");
+                                    double y = DoubleArgumentType.getDouble(context, "y");
+                                    double z = DoubleArgumentType.getDouble(context, "z");
+                                    
+                                    ResourceKey<Level> dimKey = ResourceKey.create(
+                                        Registries.DIMENSION,
+                                        McHelper.newResourceLocation(dimId)
+                                    );
+                                    Vec3 pos = new Vec3(x, y, z);
+                                    
+                                    ClientTeleportationManager.forceTeleportPlayer(
+                                        dimKey, pos
+                                    );
+                                    
+                                    return 0;
+                                })
+                            )
+                        )
+                    )
+                )
+            );
+        }
+        
+        builder.then(LiteralArgumentBuilder.<S>literal("show_mod_id_list")
+            .executes(context -> {
+                List<String> loadedModIds = O_O.getLoadedModIds();
+                String str = String.join("\n", loadedModIds);
+                support.sendFeedback(context.getSource(), Component.literal(str));
+                return 0;
+            })
+        );
+        
+        builder.then(LiteralArgumentBuilder
+            .<S>literal("force_main_thread_chunk_rebuild")
+            .then(RequiredArgumentBuilder
+                .<S, Integer>argument("frameCount", IntegerArgumentType.integer(0, 10000))
+                .executes(context -> {
+                    int frameCount = IntegerArgumentType.getInteger(context, "frameCount");
+                    ForceMainThreadRebuild.forceMainThreadRebuildFor(frameCount);
+                    return 0;
+                })
+            )
+        );
+        
+        LiteralArgumentBuilder<S> wandBuilder = LiteralArgumentBuilder.<S>literal("wand");
+        registerPortalWandCommands(wandBuilder, support);
+        builder.then(wandBuilder);
+        
+        registerSwitchCommand(
+            builder,
+            "front_clipping",
+            cond -> IPCGlobal.useFrontClipping = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "gl_check_error",
+            cond -> IPGlobal.doCheckGlError = cond
+        );
+        
+        registerSwitchCommand(
+            builder,
+            "early_light_update",
+            cond -> IPCGlobal.lateClientLightUpdate = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "early_remote_upload",
+            cond -> IPCGlobal.earlyRemoteUpload = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "super_advanced_frustum_culling",
+            cond -> IPCGlobal.useSuperAdvancedFrustumCulling = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "cross_portal_entity_rendering",
+            cond -> IPGlobal.correctCrossPortalEntityRendering = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "early_cull_portal",
+            cond -> IPCGlobal.earlyFrustumCullingPortal = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "cache_gl_buffer",
+            cond -> IPGlobal.cacheGlBuffer = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "secondary_vertex_consumer",
+            cond -> IPGlobal.useSecondaryEntityVertexConsumer = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "cull_sections_behind",
+            cond -> IPGlobal.cullSectionsBehind = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "offset_occlusion_query",
+            cond -> IPGlobal.offsetOcclusionQuery = cond
+        );
+        // S14.22/S14.24 rung-2 diagnosis levers (default OFF; S20-removal-ledgered).
+        registerSwitchCommand(
+            builder,
+            "debug_gl_state_assert",
+            cond -> IPGlobal.debugGlStateAssert = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_dye_portal_fill",
+            cond -> IPGlobal.debugDyePortalFill = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_skip_portal_sky",
+            cond -> IPGlobal.debugSkipPortalSky = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_skip_portal_terrain",
+            cond -> IPGlobal.debugSkipPortalTerrain = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_dye_view_area_mesh",
+            cond -> IPGlobal.debugDyeViewAreaMesh = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_no_aperture_depth_clamp",
+            cond -> IPGlobal.debugNoApertureDepthClamp = cond
+        );
+        // IS5-G ghost-wave discriminator run 2: skip the depth-clamp bracket around the
+        // IrisCompatPaste STAMP only (dedicated — debug_no_aperture_depth_clamp also gates the
+        // occlusion-query aperture draw and would fake the verdict).
+        registerSwitchCommand(
+            builder,
+            "debug_no_stamp_depth_clamp",
+            cond -> IPGlobal.debugNoStampDepthClamp = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_frame_boundary_probe",
+            cond -> IPGlobal.debugFrameBoundaryProbe = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_skip_portal_entities",
+            cond -> IPGlobal.debugSkipPortalEntities = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_skip_same_dim_entities",
+            cond -> IPGlobal.debugSkipSameDimEntities = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_skip_aperture_incr",
+            cond -> IPGlobal.debugSkipApertureIncr = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_skip_depth_clear",
+            cond -> IPGlobal.debugSkipDepthClear = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_skip_depth_restore",
+            cond -> IPGlobal.debugSkipDepthRestore = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_skip_stencil_clamp",
+            cond -> IPGlobal.debugSkipStencilClamp = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_aperture_no_stencil_write",
+            cond -> IPGlobal.debugApertureNoStencilWrite = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_aperture_no_depth_write",
+            cond -> IPGlobal.debugApertureNoDepthWrite = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_aperture_no_color_write",
+            cond -> IPGlobal.debugApertureNoColorWrite = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_skip_dest_extract",
+            cond -> IPGlobal.debugSkipDestExtract = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_skip_extract_only",
+            cond -> IPGlobal.debugSkipExtractOnly = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_skip_sog_feed",
+            cond -> IPGlobal.debugSkipSogFeed = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_skip_compile_drain",
+            cond -> IPGlobal.debugSkipCompileDrain = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_skip_dest_fog_install",
+            cond -> IPGlobal.debugSkipDestFogInstall = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_skip_globals_ubo",
+            cond -> IPGlobal.debugSkipGlobalsUbo = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_skip_dest_lightmap",
+            cond -> IPGlobal.debugSkipDestLightmap = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_skip_projection_install",
+            cond -> IPGlobal.debugSkipProjectionInstall = cond
+        );
+        // S14.40: the wedge fix's A/B lever + the dest-extract sub-call attribution kit.
+        registerSwitchCommand(
+            builder,
+            "debug_allow_dest_particle_extract",
+            cond -> IPGlobal.debugAllowDestParticleExtract = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_skip_extract_berd_prepare",
+            cond -> IPGlobal.debugSkipExtractBerdPrepare = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_skip_extract_erd_prepare",
+            cond -> IPGlobal.debugSkipExtractErdPrepare = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_skip_extract_entities",
+            cond -> IPGlobal.debugSkipExtractEntities = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_skip_extract_block_entities",
+            cond -> IPGlobal.debugSkipExtractBlockEntities = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_skip_extract_weather",
+            cond -> IPGlobal.debugSkipExtractWeather = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_skip_extract_sky",
+            cond -> IPGlobal.debugSkipExtractSky = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_skip_extract_border",
+            cond -> IPGlobal.debugSkipExtractBorder = cond
+        );
+        // S14.41: skip-gizmos became the DEFAULT (the wedge fix); this inverse lever restores the
+        // corrupting vanilla emission for A/B attribution.
+        registerSwitchCommand(
+            builder,
+            "debug_allow_dest_extract_gizmos",
+            cond -> IPGlobal.debugAllowDestExtractGizmos = cond
+        );
+        // S14.42: _enable fires ONE render-chain dump line (self-clears); _disable is a no-op.
+        // For the far-walk terrain-wipe hunt: run it WHILE the terrain is wiped.
+        registerSwitchCommand(
+            builder,
+            "debug_dump_render_chain",
+            cond -> {
+                if (cond) {
+                    qouteall.imm_ptl.core.render.RenderChainProbe.dumpOnce = true;
+                }
+            }
+        );
+        // S14.31: _enable arms ONE frame capture (self-clears); _disable is a no-op.
+        registerSwitchCommand(
+            builder,
+            "debug_capture_frame",
+            cond -> {
+                if (cond) {
+                    qouteall.imm_ptl.core.render.DrawCallTrace.armed = true;
+                }
+            }
+        );
+        // S14.45: _enable arms a manual ~40-frame flash/stutter ring capture + batched dump
+        // (baseline without a crossing; crossings auto-arm the same capture); _disable no-op.
+        registerSwitchCommand(
+            builder,
+            "debug_capture_flash",
+            cond -> {
+                if (cond) {
+                    qouteall.imm_ptl.core.render.TeleportFlashProbe.armManual();
+                }
+            }
+        );
+        // S14.49: _enable dumps ONE light/mesh/tracker discriminator line for the crosshair
+        // section (the superflat boundary-shadow hunt — run on a SHADOWED block, then once on a
+        // healthy one for contrast); _disable is a no-op.
+        registerSwitchCommand(
+            builder,
+            "debug_dump_light_section",
+            cond -> {
+                if (cond) {
+                    qouteall.imm_ptl.core.render.LightSectionDump.dump();
+                }
+            }
+        );
+        registerSwitchCommand(
+            builder,
+            "cloud_optimization",
+            cond -> IPGlobal.cloudOptimization = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "cross_portal_collision",
+            cond -> IPGlobal.crossPortalCollision = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "nofog",
+            cond -> IPGlobal.debugDisableFog = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "depth_clamp_for_portal_rendering",
+            cond -> IPGlobal.enableDepthClampForPortalRendering = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "shared_block_mesh_builder",
+            cond -> IPGlobal.enableSharedBlockMeshBuffers = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "entity_pos_interpolation",
+            cond -> IPGlobal.allowClientEntityPosInterpolation = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "always_override_terrain_setup",
+            cond -> IPGlobal.alwaysOverrideTerrainSetup = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "view_bob_reduce",
+            cond -> IPGlobal.viewBobbingReduce = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "iris_stencil",
+            cond -> IPCGlobal.debugEnableStencilWithIris = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "another_stencil",
+            cond -> IPCGlobal.useSeparatedStencilFormat = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "experimental_iris_portal_renderer",
+            cond -> IPCGlobal.experimentalIrisPortalRenderer = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "portal_rendering_cave_culling",
+            cond -> MyGameRenderer.enablePortalCaveCulling = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "log_client_player_colliding_portal_update",
+            cond -> IPGlobal.logClientPlayerCollidingPortalUpdate = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "entity_untrack_debug",
+            cond -> IPGlobal.entityUntrackDebug = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "entity_track_debug",
+            cond -> IPGlobal.entityTrackDebug = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "client_portal_load_debug",
+            cond -> IPGlobal.clientPortalLoadDebug = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "mesh_render",
+            cond -> IPGlobal.debugRenderPortalShapeMesh = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "teleportation_debug",
+            cond -> IPGlobal.teleportationDebugEnabled = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "debug_text_to_top",
+            cond -> IPGlobal.moveDebugTextToTop = cond
+        );
+        registerSwitchCommand(
+            builder,
+            "box_portal_special_iteration",
+            cond -> IPGlobal.boxPortalSpecialIteration = cond
+        );
+        
+        builder.then(LiteralArgumentBuilder
+            .<S>literal("print_class_path")
+            .executes(context -> {
+                printClassPath();
+                return 0;
+            })
+        );
+        
+        builder.then(LiteralArgumentBuilder
+            .<S>literal("test_invalid_rpc")
+            .executes(context -> {
+                McRemoteProcedureCall.tellServerToInvoke(
+                    "aaa.bbb.WrongClassRemoteCallable.method"
+                );
+                return 0;
+            })
+        );
+        
+        dispatcher.register(builder);
+    }
+    
+    private static <S> void registerPortalWandCommands(
+        LiteralArgumentBuilder<S> builder, ClientPlatform.ClientCommandSupport<S> support
+    ) {
+        builder.then(LiteralArgumentBuilder
+            .<S>literal("set_cursor_alignment")
+            .then(RequiredArgumentBuilder.<S, Integer>argument("alignment", IntegerArgumentType.integer(0))
+                .executes(context -> {
+                    int alignment = IntegerArgumentType.getInteger(context, "alignment");
+                    
+                    IPConfig config = IPConfig.getConfig();
+                    config.portalWandCursorAlignment = alignment;
+                    config.saveConfigFile();
+                    
+                    support.sendFeedback(context.getSource(), Component.translatable("imm_ptl.wand.alignment_updated"));
+                    
+                    return 0;
+                })
+            )
+        );
+    }
+    
+    private static void printClassPath() {
+        System.out.println(
+            Arrays.stream(
+                ((URLClassLoader) ClassLoader.getSystemClassLoader()).getURLs()
+            ).map(
+                url -> "\"" + url.getFile().substring(1).replace("%20", " ") + "\""
+            ).collect(Collectors.joining(",\n"))
+        );
+    }
+    
+    private static <S> void registerSwitchCommand(
+        LiteralArgumentBuilder<S> builder,
+        String name,
+        Consumer<Boolean> setFunction
+    ) {
+        builder = builder.then(LiteralArgumentBuilder
+            .<S>literal(name + "_enable")
+            .executes(context -> {
+                setFunction.accept(true);
+                return 0;
+            })
+        );
+        builder = builder.then(LiteralArgumentBuilder
+            .<S>literal(name + "_disable")
+            .executes(context -> {
+                setFunction.accept(false);
+                return 0;
+            })
+        );
+    }
+    
+    private static <S> int isClientChunkLoaded(CommandContext<S> context) throws CommandSyntaxException {
+        int chunkX = IntegerArgumentType.getInteger(context, "chunkX");
+        int chunkZ = IntegerArgumentType.getInteger(context, "chunkZ");
+        RemoteCallables.reportClientChunkLoadStatus(Minecraft.getInstance().level.dimension(), chunkX, chunkZ);
+        return 0;
+    }
+    
+    public static class RemoteCallables {
+        public static void reportClientChunkLoadStatus(ResourceKey<Level> dimension, int chunkX, int chunkZ) {
+            ClientLevel world = ClientWorldLoader.getWorld(dimension);
+            ChunkAccess chunk = world.getChunk(chunkX, chunkZ);
+            CHelper.printChat(
+                chunk != null && !(chunk instanceof EmptyLevelChunk) ?
+                    "client loaded" : "client not loaded"
+            );
+        }
+        
+        public static void reportClientPlayerStatus() {
+            LocalPlayer playerSP = Minecraft.getInstance().player;
+            
+            CHelper.printChat(
+                String.format(
+                    "On Client %s %s removal:%s added:%s age:%s",
+                    playerSP.level().dimension().identifier(),
+                    playerSP.blockPosition(),
+                    playerSP.getRemovalReason(),
+                    playerSP.level().getEntity(playerSP.getId()) != null,
+                    playerSP.tickCount
+                )
+            );
+        }
+        
+        public static void doListPortals() {
+            StringBuilder result = new StringBuilder();
+            
+            result.append("Client Portals\n");
+            ClientWorldLoader.getClientWorlds().forEach((world) -> {
+                result.append(world.dimension().identifier().toString() + "\n");
+                for (Entity e : world.entitiesForRendering()) {
+                    if (e instanceof Portal) {
+                        result.append(e.toString());
+                        result.append("\n");
+                    }
+                }
+            });
+            
+            CHelper.printChat(result.toString());
+        }
+        
+        public static void reportResourceConsumption() {
+            StringBuilder str = new StringBuilder();
+            
+            str.append("Client Chunk:\n");
+            ClientWorldLoader.getClientWorlds().forEach(world -> {
+                str.append(String.format(
+                    "%s %s\n",
+                    world.dimension().identifier(),
+                    world.getChunkSource().getLoadedChunksCount()
+                ));
+            });
+            
+            
+            str.append("Chunk Mesh Sections:\n");
+            ClientWorldLoader.WORLD_RENDERER_MAP.forEach(
+                (dimension, worldRenderer) -> {
+                    // C2-1b sodium yield (IgnoringViewArea — sodium owns terrain): instanceof
+                    // instead of the bare cast — under Sodium the field holds IgnoringViewArea
+                    // (user-invokable CCE otherwise; also null-safe pre-first-extract).
+                    // C2-1c vB fold: blame sodium only when a FOREIGN viewArea exists — a null
+                    // field is the pre-first-extract state, sodium present or not.
+                    net.minecraft.client.renderer.ViewArea rawStorage =
+                        ((IEWorldRenderer) worldRenderer).ip_getBuiltChunkStorage();
+                    str.append(String.format(
+                        "%s %s\n",
+                        dimension.identifier(),
+                        rawStorage instanceof ImmPtlViewArea immPtlViewArea
+                            ? immPtlViewArea.getManagedSectionNum()
+                            : (rawStorage == null
+                                ? "(no viewArea yet — created at the dim's first extract)"
+                                : "(no ImmPtlViewArea — sodium owns terrain)")
+                    ));
+                }
+            );
+            
+            String result = str.toString();
+            
+            CHelper.printChat(result);
+        }
+        
+        public static void setNoFog(boolean cond) {
+            IPGlobal.debugDisableFog = cond;
+        }
+    }
+    
+    private static int setMaxPortalLayer(int m) {
+        IPGlobal.maxPortalLayer = m;
+        return 0;
+    }
+    
+    
+    public static class TestRemoteCallable {
+        public static void serverToClient(
+            String str, int integer, double doubleNum, Identifier identifier,
+            ResourceKey<Level> dimension, ResourceKey<Biome> biomeKey,
+            BlockPos blockPos, Vec3 vec3d
+        ) {
+            Helper.log(str + integer + doubleNum + identifier + dimension + biomeKey + blockPos + vec3d);
+        }
+        
+        public static void clientToServer(
+            ServerPlayer player,
+            UUID uuid,
+            Block block, BlockState blockState,
+            Item item, ItemStack itemStack,
+            CompoundTag compoundTag, Component text, int[] intArray
+        ) {
+            Helper.log(
+                player.getName().getString() + uuid + block + blockState + item + itemStack
+                    + compoundTag + text.getString() + Arrays.toString(intArray)
+            );
+        }
+    }
+    
+    private static void testRemoteProcedureCall(ServerPlayer player) {
+        Minecraft.getInstance().execute(() -> {
+            CompoundTag compoundTag = new CompoundTag();
+            compoundTag.put("test", IntTag.valueOf(7));
+            McRemoteProcedureCall.tellServerToInvoke(
+                "qouteall.imm_ptl.core.commands.ClientDebugCommand.TestRemoteCallable.clientToServer",
+                new UUID(3, 3),
+                Blocks.ACACIA_PLANKS,
+                Blocks.NETHER_PORTAL.defaultBlockState().setValue(NetherPortalBlock.AXIS, Direction.Axis.Z),
+                Items.COMPASS,
+                new ItemStack(Items.ACACIA_LOG, 2),
+                compoundTag,
+                Component.literal("test"),
+                new int[]{777, 765}
+            );
+        });
+        
+        player.server.execute(() -> {
+            McRemoteProcedureCall.tellClientToInvoke(
+                player,
+                "qouteall.imm_ptl.core.commands.ClientDebugCommand.TestRemoteCallable.serverToClient",
+                "string", 2, 3.5, McHelper.newResourceLocation("imm_ptl:oops"),
+                Level.NETHER, Biomes.JUNGLE,
+                new BlockPos(3, 5, 4),
+                new Vec3(7, 4, 1)
+            );
+        });
+    }
+    
+    
+    public static void disableWarning() {
+        IPConfig ipConfig = IPConfig.getConfig();
+        ipConfig.enableWarning = false;
+        ipConfig.saveConfigFile();
+    }
+    
+    public static void disableWarningFor(String warningKey) {
+        IPConfig ipConfig = IPConfig.getConfig();
+        ipConfig.disabledWarnings.add(warningKey);
+        ipConfig.saveConfigFile();
+    }
+    
+    public static void disableUpdateCheck() {
+        IPConfig ipConfig = IPConfig.getConfig();
+        ipConfig.enableUpdateNotification = false;
+        ipConfig.saveConfigFile();
+    }
+}

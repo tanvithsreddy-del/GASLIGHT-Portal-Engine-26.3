@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "id": "${mod_id}",
+  "version": "${mod_version}",
+  "name": "${mod_name}",
+  "description": "${mod_description}",
+  "authors": [
+    "warwa"
+  ],
+  "license": "Apache-2.0",
+  "icon": "assets/seamlessportals/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "com.warwa.seamlessportals.fabric.SeamlessPortalsModFabric"
+    ],
+    "client": [
+      "com.warwa.seamlessportals.fabric.SeamlessPortalsClientFabric"
+    ],
+    "fabric-client-gametest": [
+      "com.warwa.seamlessportals.fabric.gametest.TitleCardCapture",
+      "com.warwa.seamlessportals.fabric.gametest.CrossingSmoke"
+    ],
+    "modmenu": [
+      "com.warwa.seamlessportals.fabric.ModMenuIntegration"
+    ]
+  },
+  "accessWidener": "seamlessportals.accesswidener",
+  "mixins": [
+    "seamlessportals-common.mixins.json",
+    "seamlessportals-ip-qmisc.mixins.json",
+    "seamlessportals-ip-core-common.mixins.json",
+    "seamlessportals-ip-client.mixins.json",
+    "seamlessportals-ip-platform.mixins.json",
+    "seamlessportals-ip-peripheral.mixins.json",
+    "seamlessportals-ip-dimlib.mixins.json",
+    "seamlessportals-ip-compat.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=${fabric_loader_version}",
+    "minecraft": ">=26.3",
+    "fabric-api": "*",
+    "cloth-config": ">=26.3"
+  }
+}

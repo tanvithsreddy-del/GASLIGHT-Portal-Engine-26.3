@@ -1,0 +1,226 @@
+plugins {
+    id 'multiloader-common'
+    id 'net.neoforged.moddev'
+}
+
+// F21 compileOnly stub-classpath source set (entity-portal migration —
+// migration/EXECUTION_PLAN.md §3 S4(a) "Sodium/Iris compile reality"; S00-U0-decisions
+// F21; S04-compat.md §3). IP's HELD compat files reference third-party mod types that had
+// no MC 26.2 build at F21. This source set holds EMPTY shells of exactly those types
+// (correct FQN/kind + only the members IP touches). It is compileOnly ONLY — never shipped:
+// it is wired onto :common's and the loaders' COMPILE classpaths (the loaders recompile the
+// raw common source, so the -Pip_scc_closed=true probe there also needs the shells) but
+// never onto runtime/implementation. Deleted at S20 with the rest of the holding machinery.
+//
+// S19-E UPDATE: the sodium (net.caffeinemc.mods.sodium.*) and iris (net.irisshaders.iris.*)
+// shells were RETIRED this stage — real Sodium 0.9.1 + Iris 1.11.2 DO ship for 26.2 and are
+// now on all three modules' compile classpaths as compileOnly (see the dependencies block),
+// so the held compat files compile against the real types. Only gravity_changer.* remains in
+// this source set (still no 26.2 build). The rest of the F21 machinery is otherwise unchanged.
+sourceSets {
+    ipStubs
+    // S10-A loader-seam foundation (migration/EXECUTION_PLAN.md §3 S10; port-note
+    // S10A-loader-seam.md). SEPARATE from ipStubs: this set holds compileOnly shells of the
+    // net.fabricmc.* types the HELD IP tree references (@Environment/EnvType, the FabricLoader
+    // family, tick/chunk lifecycle events, config-phase networking, the Fabric Event phase
+    // system, the attachment-impl sync types). Unlike sodium/iris/gravity (ipStubs), these
+    // Fabric types ARE provided by the real fabric-api on the loader classpath — so this set is
+    // wired onto :common's compile classpath ONLY (below), NEVER onto the loader classpath
+    // (ipStubsClasspath). That keeps them off the fabric loader compile, where a stub of e.g.
+    // PayloadTypeRegistry would SHADOW the real fabric-api type that FabricPlatformHelper uses
+    // and turn the shipping :fabric build red. At S13 (ip_scc_closed=true) the fabric loader
+    // recompiles the held tree against REAL fabric-api, which provides every net.fabricmc type
+    // (and the addTask/completeTask interface injections a compileOnly stub cannot reproduce).
+    // compileOnly only, never shipped. Removed at S20.
+    fabricStubs
+}
+
+neoForge {
+    neoFormVersion = project.neo_form_version
+
+    def at = file('src/main/resources/META-INF/accesstransformer.cfg')
+    if (at.exists()) {
+        accessTransformers.from(at.absolutePath)
+    }
+
+    // S2 math harness (migration/EXECUTION_PLAN.md §3 S2(a), D4.5): the authored
+    // DQuaternion/Plane invariant tests exercise ported IP classes whose API surface is
+    // Minecraft types (Vec3, CompoundTag, JOML), so the TEST source set needs the same
+    // modding dependencies the main source set gets by default. Without this,
+    // :common:compileTestJava cannot resolve net.minecraft.* from test code.
+    addModdingDependenciesTo sourceSets.test
+
+    // F21: the stub method signatures reference vanilla types (Level, TextureAtlasSprite,
+    // Entity, Player, Direction, Vec3) + JOML (Quaternionf), so the stub source set needs
+    // the same Minecraft compile classpath the main source set gets.
+    addModdingDependenciesTo sourceSets.ipStubs
+
+    // S10-A: the net.fabricmc.* shells reference vanilla types (MinecraftServer, ServerLevel,
+    // ClientLevel, LevelChunk, ServerPlayer, Identifier, CustomPacketPayload, StreamCodec,
+    // ServerConfigurationPacketListenerImpl, ...), so the fabricStubs set needs the same
+    // Minecraft compile classpath.
+    addModdingDependenciesTo sourceSets.fabricStubs
+}
+
+repositories {
+    // JUnit (S0 test infrastructure) resolves from Maven Central. Declared
+    // explicitly (harmless if a plugin already added it) and AFTER the
+    // plugin-provided repositories, so existing dependency resolution is
+    // unchanged.
+    mavenCentral()
+
+    // S19-E: real Sodium 0.9.1 + Iris 1.11.2 for MC 26.2 (retires the F21
+    // sodium/iris stubs). Both publish to Modrinth's maven with EMPTY POMs
+    // (no transitives). compileOnly below — see the dependency comment.
+    maven {
+        name = 'Modrinth'
+        url = 'https://api.modrinth.com/maven'
+        content {
+            includeGroup 'maven.modrinth'
+        }
+    }
+
+    // S19-E: real Cloth Config 26.2.155 for MC 26.2 (retires the F21
+    // me.shedaniel.autoconfig no-op deleted from this module's source this stage).
+    // compileOnly below — the me.shedaniel.autoconfig imports in the held IP config
+    // tree must resolve against the real API here. IP build.gradle:34 resolves cloth
+    // from this same maven.
+    maven {
+        name = 'Shedaniel'
+        url = 'https://maven.shedaniel.me/'
+        content {
+            includeGroupByRegex 'me\\.shedaniel.*'
+        }
+    }
+}
+
+dependencies {
+    compileOnly group: 'org.spongepowered', name: 'mixin', version: '0.8.5'
+    // ASM tree types are required for IMixinConfigPlugin.preApply/postApply
+    // signatures (org.objectweb.asm.tree.ClassNode). Mixin itself depends on
+    // them at runtime; we just need them on the compile classpath.
+    compileOnly group: 'org.ow2.asm', name: 'asm-tree', version: '9.7'
+
+    // S19-E: real Sodium 0.9.1 + Iris 1.11.2 on :common:compileJava's compile classpath,
+    // replacing the retired F21 sodium/iris stubs (ipStubs net.caffeinemc/** + net.irisshaders/**
+    // deleted this stage). The held IP compat files (SodiumInterface/SodiumRenderingContext/
+    // IESodiumWorldRenderer/IrisInterface/ExperimentalIrisPortalRenderer) now compile against
+    // the REAL types. compileOnly, NOT plain implementation: the compat code is RUNTIME-DEAD
+    // today (the On*Present invokers are never wired — that activation is C2), so the jars must
+    // never enter any runtime/shipped configuration unless explicitly opted in (see
+    // fabric/build.gradle -PsodiumRuntime / -PirisRuntime). Both POMs are empty (no transitives).
+    // NOT modCompileOnly: this build is remap-free (26.2 unobfuscated) — plain compileOnly, same
+    // convention as fabric-api/modmenu. Retired with the rest of the compat holding at S20/C2.
+    compileOnly "maven.modrinth:sodium:${project.sodium_version}"
+    compileOnly "maven.modrinth:iris:${project.iris_version}"
+
+    // S19-E: real Cloth Config 26.2.155 on :common:compileJava's compile classpath,
+    // replacing the retired F21 me.shedaniel.autoconfig no-op (the 8 in-tree
+    // me.shedaniel.autoconfig.** files deleted this stage — they would SHADOW the real
+    // jar on this compile AND in the shipped jar). The held IP config tree (IPModMain,
+    // IPGlobal, IPConfig, IPConfigGUI, IPModMenuConfigEntry) imports
+    // me.shedaniel.autoconfig.* — those now resolve against the REAL API here.
+    // compileOnly, NOT implementation: :common ships no runtime classpath of its own
+    // (the loaders recompile its raw source); cloth's actual runtime presence is
+    // arranged on :fabric (see fabric/build.gradle — plain `implementation` there).
+    // Excludes mirror IP build.gradle:85 (fabric-api) + drop cloth's transitive
+    // fabric-loader (this project supplies both). Remap-free build → plain compileOnly,
+    // same convention as sodium/iris/mixin above. Retired at S20/C2.
+    compileOnly("me.shedaniel.cloth:cloth-config-fabric:${project.cloth_config_version}") {
+        exclude(group: 'net.fabricmc.fabric-api')
+        exclude(group: 'net.fabricmc', module: 'fabric-loader')
+    }
+
+    // Entity-portal migration S10-C: MixinExtras on :common:compileJava's compile classpath.
+    // The IP common mixins use com.llamalad7.mixinextras (@WrapOperation / @Local / Operation /
+    // LocalRef) — first consumed by the held S10-C container_gui + interaction mixins
+    // (MixinAbstractContainerMenu, MixinContainer, MixinServerPlayerGameMode, MixinBucketItem;
+    // the landed chunk_sync/mc_util mixins used base Mixin only, hence no prior need). MixinExtras
+    // is bundled with the loader at runtime (the neoforge run uses mixinextras 0.5.4), exactly
+    // like base Mixin above — so this is compileOnly, never shipped. Needed for the
+    // -Pip_scc_closed=true probe to compile the held IP mixin tree. Removed at S20.
+    compileOnly group: 'io.github.llamalad7', name: 'mixinextras-common', version: '0.5.3'
+
+    // F21 stub shells on :common:compileJava's compile classpath ONLY (never runtime,
+    // never in the shipped jar — jar packages sourceSets.main.output only). Referenced by
+    // the held compat files, which are excluded in the shipping build and compiled only at
+    // the -Pip_scc_closed=true probe. See the ipStubs source set above and S00-U0-decisions
+    // F21. Removed at S20.
+    compileOnly sourceSets.ipStubs.output
+
+    // S10-A: net.fabricmc.* shells on :common:compileJava's compile classpath ONLY. NOT
+    // exposed to the loader classpath (no ipStubsClasspath entry) — the loaders provide the
+    // real fabric-api. This resolves the held tree's loader-facade/@Environment/config-phase
+    // references at the -Pip_scc_closed=true probe without shadowing real fabric-api on the
+    // fabric build. compileOnly only, never shipped. Removed at S20. See fabricStubs above and
+    // port-note S10A-loader-seam.md.
+    compileOnly sourceSets.fabricStubs.output
+
+    // S0 JUnit test infrastructure for the entity-portal migration
+    // (migration/EXECUTION_PLAN.md §3 S0(a); D4.5 math harness — the S2
+    // DQuaternion/Plane invariant tests and, at S13, the carried IP
+    // Mesh2DTest/HelperTest run through this). :common:compileTestJava
+    // carries its OWN held-paths list (IpHeldPaths.TEST_HELD_PATHS, D1.3).
+    testImplementation platform('org.junit:junit-bom:5.13.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    // Gradle 9 no longer injects the platform launcher onto the test runtime
+    // classpath automatically.
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+test {
+    useJUnitPlatform()
+}
+
+configurations {
+    commonJava {
+        canBeResolved = false
+        canBeConsumed = true
+    }
+    commonResources {
+        canBeResolved = false
+        canBeConsumed = true
+    }
+    // F21: consumable view of the compiled stub classes so the loader modules — which
+    // recompile the RAW common source directory and therefore also see the held compat
+    // files at the -Pip_scc_closed=true probe — can put the same shells on their
+    // compileJava classpath (multiloader-loader.gradle). Consume-only; never resolved here.
+    // Removed at S20.
+    ipStubsClasspath {
+        canBeResolved = false
+        canBeConsumed = true
+    }
+    // S13-B: consumable view of the compiled net.fabricmc.* shells, for loaders that do NOT
+    // provide real fabric-api (NeoForge). Post-flip (ip_scc_closed=true) the loaders recompile
+    // the RAW common source directory, which now includes the held qouteall tree's net.fabricmc.*
+    // references. The fabric loader resolves those against REAL fabric-api (so it must NOT see
+    // these shells — they would SHADOW the real types FabricPlatformHelper uses, §6 above); the
+    // NeoForge loader has no fabric-api, so it consumes THESE shells instead. Wired neoforge-only
+    // in multiloader-loader.gradle. Consume-only; never resolved here. Removed at S20.
+    fabricStubsClasspath {
+        canBeResolved = false
+        canBeConsumed = true
+    }
+}
+
+// F21: package the compiled stub shells into a jar exposed via ipStubsClasspath. compileOnly
+// on the consuming side — never shipped. Removed at S20.
+tasks.register('ipStubsJar', Jar) {
+    archiveClassifier = 'f21-ipstubs'
+    from sourceSets.ipStubs.output
+}
+
+// S13-B: package the compiled net.fabricmc.* shells into a jar exposed via fabricStubsClasspath,
+// consumed compileOnly by non-fabric loaders (NeoForge) that lack real fabric-api. Never shipped.
+// Removed at S20.
+tasks.register('fabricStubsJar', Jar) {
+    archiveClassifier = 's10a-fabricstubs'
+    from sourceSets.fabricStubs.output
+}
+
+artifacts {
+    commonJava sourceSets.main.java.sourceDirectories.singleFile
+    commonResources sourceSets.main.resources.sourceDirectories.singleFile
+    ipStubsClasspath tasks.named('ipStubsJar')
+    fabricStubsClasspath tasks.named('fabricStubsJar')
+}
