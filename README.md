@@ -11,8 +11,11 @@ into this source repository.
 The local changes pin Gradle 9.7.0 with its SHA-256, use Java 25 without a
 machine-only JDK path, and apply the particle accessor mixin in the explicit
 entity-portals-off configuration. GASLIGHT-facing defaults keep ordinary
-Nether and End portals: even an older `immersive_portals.json` requesting
-converted portals is guarded by `preserveVanillaDimensionPortals=true`.
+Nether and End portals in the default `entityPortals=true` mode: even an older
+`immersive_portals.json` requesting converted portals is guarded by
+`preserveVanillaDimensionPortals=true`. The legacy `entityPortals=false`
+block-era fallback still changes vanilla portals and is not a supported
+GASLIGHT profile.
 The first-launch Immersive Portals screen, creative-mode wiki chat tip, and
 automatic update announcement are removed. Compatibility and error warnings
 remain visible. The converted-portal crossing fixture opts out of the
